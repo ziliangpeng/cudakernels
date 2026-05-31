@@ -4,22 +4,24 @@
 **Sources**:
 - [siboehm: CUDA Matmul Worklog](https://siboehm.com/articles/22/CUDA-MMM) — A100, N=4096, FP32 path, vs cuBLAS FP32
 - [Pranjal: Outperforming cuBLAS on H100](https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog) — H100, N=4096, TC path, vs cuBLAS BF16
-- Our data: [ncu-profiling-2026-05-30.md](ncu-profiling-2026-05-30.md) — H100, N=2048, both paths
+- Our data: [ncu-profiling-2026-05-30.md](ncu-profiling-2026-05-30.md) — H100, N=1024/2048/4096, both paths
 
-> **Caveat**: Matrix sizes differ (our N=2048 vs their N=4096), and siboehm's baseline is FP32 cuBLAS while ours is TF32 TC cuBLAS. All "vs cuBLAS" percentages compared to each blog's own cuBLAS baseline.
+> **Caveat**: Matrix sizes differ (our N=1024/2048 vs their N=4096 for step-by-step), and % values use each blog's own cuBLAS baseline. FP32 baseline is FP32 cuBLAS for siboehm, TF32 TC cuBLAS (495T) for us.
 
 ## FP32 Hand-Written Kernel Path
 
-| Step | siboehm (A100, 4K) | Ours (H100, 2K) | Notes |
-|---|---|---|---|
-| Naive | 1.3% (309 GFLOPs) | — (skipped at 2K) | |
-| Coalesced | 8.5% (1,987 G) | ~13% (6.6 TFLOPS) | H100 faster GMEM hides coalescing gap |
-| SMEM tiling | 12.8% (2,980 G) | ~18% (9.2 TFLOPS) | Same pattern, H100's bigger SMEM helps early steps |
-| 1D blocktile | 36.5% (8,475 G) | ~34% (16.9 TFLOPS) | Nearly identical |
-| 2D blocktile | 68.7% (15,972 G) | ~43% (21.6 TFLOPS) | **-25.7pp gap** ⚠️ |
-| Vectorized | 78.4% (18,237 G) | ~65% (32.8 TFLOPS) | **-13.4pp gap** |
-| Warptile | 93.7% (21,779 G) | ~56% (28.4 TFLOPS) | **-37.7pp gap** ⚠️⚠️ |
-| Autotuning | 84.8% (19,721 G) | — (not done) | |
+Pranjal took siboehm's final warptile kernel and ran it on H100: **31.8 TFLOPS, 4% of cuBLAS TF32 TC** (717T). This is the only FP32 data point from Pranjal's blog — he skips the intermediate FP32 steps and jumps straight to Tensor Cores.
+
+| Step | siboehm (A100, 4K) | Pranjal (H100, 4K) | Ours (H100, 2K) | Notes |
+|---|---|---|---|---|
+| Naive | 1.3% (309 GFLOPs) | — | — (skipped at 2K) | |
+| Coalesced | 8.5% (1,987 G) | — | ~13% (6.6 TFLOPS) | H100 faster GMEM hides coalescing gap |
+| SMEM tiling | 12.8% (2,980 G) | — | ~18% (9.2 TFLOPS) | H100's bigger SMEM helps early steps |
+| 1D blocktile | 36.5% (8,475 G) | — | ~34% (16.9 TFLOPS) | Nearly identical |
+| 2D blocktile | 68.7% (15,972 G) | — | ~43% (21.6 TFLOPS) | **-25.7pp gap** ⚠️ |
+| Vectorized | 78.4% (18,237 G) | — | ~65% (32.8 TFLOPS) | **-13.4pp gap** |
+| Warptile (Simon final) | 93.7% (21,779 G) | **31.8 TFLOPS** (4% vs cuBLAS TF32) | ~56% (28.4 TFLOPS) | **-37.7pp gap** ⚠️⚠️ |
+| Autotuning | 84.8% (19,721 G) | — | — | |
 
 ### Diagnosis
 
@@ -37,7 +39,7 @@ Our kernels diverge from siboehm at 2D blocktile. Root causes:
 
 | Step | Pranjal (H100, 4K) | Ours (H100, 2K) | Notes |
 |---|---|---|---|
-| Simon's FP32 | 4% (31.8 TFLOPS) | — | |
+| Simon's FP32 | 4% (31.8 TFLOPS) | 4.6% (32.9 TFLOPS @ 4K) | We beat Simon on H100 |
 | **Tensor Core (WMMA/WGMMA)** | **44%** (317.6 TFLOPS) | **2.6%** (25.6 TFLOPS) | **12.4× gap** ⚠️⚠️ |
 | Larger tiles | 59% (423 T) | — | |
 | Async loads (TMA) | 70% (498.2 T) | — | |
