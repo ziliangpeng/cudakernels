@@ -4,7 +4,7 @@
 **Sources**:
 - [siboehm: CUDA Matmul Worklog](https://siboehm.com/articles/22/CUDA-MMM) — A100, N=4096, FP32, vs cuBLAS FP32
 - [Pranjal: Outperforming cuBLAS on H100](https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog) — H100, N=4096, TC, vs cuBLAS BF16
-- Our data: [ncu-profiling-2026-05-30.md](ncu-profiling-2026-05-30.md) — H100, N=4096
+- Our data: [ncu-profiling-2026-05-30.md](../docs/ncu-profiling-2026-05-30.md) — H100, N=4096
 
 ---
 
@@ -12,22 +12,25 @@
 
 **N=4096. Both sides compared against their own cuBLAS FP32 baseline.**
 
-| | Our cuBLAS FP32 | Our cuBLAS FP32 |
+| | Our cuBLAS FP32 | Simon's cuBLAS FP32 |
 |---|---|---|
 | Baseline | 52.2 TFLOPS (H100, CUBLAS_PEDANTIC_MATH) | 23.2 TFLOPS (A100) |
+| Source | [`matmul_cublas.cu`](matmul_cublas.cu) | — |
 
-Our 2D blocktile and warptile use hardcoded tile sizes (BM/BN/BK). Simon autotunes. All % are vs each side's own cuBLAS FP32.
+Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autotunes. All % are vs each side's own cuBLAS FP32.
 
-| Step | Ours (H100, 4K, no autotune) | Simon (A100, 4K, autotuned) | Gap | Note |
-|---|---|---|---|---|
-| Naive | — | 1.3% (0.3 T) | — | |
-| Coalesced | **10.9%** (5.7 T) | 8.5% (2.0 T) | +2.4pp ✅ | H100 GMEM bandwidth helps |
-| SMEM tiling | **17.2%** (9.0 T) | 12.8% (3.0 T) | +4.4pp ✅ | H100 SMEM larger/faster |
-| 1D blocktile | 33.7% (17.6 T) | 36.5% (8.5 T) | −2.8pp ≈ | Nearly identical |
-| 2D blocktile | 42.9% (22.4 T) | 68.7% (16.0 T) | **−25.8pp** ⚠️ | Tile sizes diverge |
-| Vectorized | 63.0% (32.9 T) | 78.4% (18.2 T) | −15.4pp ⚠️ | |
-| Warptile | 54.2% (28.3 T) | **93.7%** (21.8 T) | **−39.5pp** ⚠️⚠️ | Regresses vs our vectorized! |
-| Autotuning | — | 84.8% (19.7 T) | — | |
+| Step | File | `__global__` kernel | Ours (H100, 4K, no autotune) | Simon (A100, 4K, autotuned) | Gap | Note |
+|---|---|---|---|---|---|---|
+| Naive | [`matmul_naive.cu`](matmul_naive.cu) | `matmulNaiveKernel` | — | 1.3% (0.3 T) | — | |
+| Coalesced | [`matmul_coalesced.cu`](matmul_coalesced.cu) | `matmulCoalescedKernel` | **10.9%** (5.7 T) | 8.5% (2.0 T) | +2.4pp ✅ | H100 GMEM bandwidth helps |
+| SMEM tiling | [`matmul_smem.cu`](matmul_smem.cu) | `matmulSmemKernel` | **17.2%** (9.0 T) | 12.8% (3.0 T) | +4.4pp ✅ | H100 SMEM larger/faster |
+| 1D blocktile | [`matmul_1d_blocktile.cu`](matmul_1d_blocktile.cu) | `matmul1DBlocktileKernel` | 33.7% (17.6 T) | 36.5% (8.5 T) | −2.8pp ≈ | Nearly identical |
+| 2D blocktile | [`matmul_2d_blocktile.cu`](matmul_2d_blocktile.cu) | `matmul2DBlocktileKernel` | 42.9% (22.4 T) | 68.7% (16.0 T) | **−25.8pp** ⚠️ | Tile sizes diverge |
+| Vectorized | [`matmul_vectorized.cu`](matmul_vectorized.cu) | `matmulVectorizedKernel` | 63.0% (32.9 T) | 78.4% (18.2 T) | −15.4pp ⚠️ | |
+| Warptile | [`matmul_warptile.cu`](matmul_warptile.cu) | `matmulWarptileKernel` | 54.2% (28.3 T) | **93.7%** (21.8 T) | **−39.5pp** ⚠️⚠️ | Regresses vs our vectorized! |
+| Autotuning | — | — | — | 84.8% (19.7 T) | — | |
+
+Shared infra: [`matmul.cpp`](matmul.cpp) (benchmark harness), [`matmul_kernel.h`](matmul_kernel.h) (base class), [`matrix_init.{h,cu}`](matrix_init.cu) (CPU reference).
 
 ### Why We Diverge at 2D Blocktile
 
@@ -57,19 +60,21 @@ Even at 100% vs cuBLAS FP32 on H100, we'd only reach ~52 TFLOPS. Tensor Cores of
 
 **N=4096 (Pranjal) / N=4096 for FP32 step, N=2048 for TC step (ours). Both vs cuBLAS BF16 = 716.7 TFLOPS (Pranjal's baseline).**
 
-| Step | Technique | Pranjal | Ours | Status |
-|---|---|---|---|---|
-| — | Simon's FP32 (H100) | 4.4% (31.8 T) | 4.6% (32.9 T @ 4K) | ✅ Beat Simon |
-| K1 | **Tensor Core** (WMMA/WGMMA) | **44.3%** (317.6 T) | **2.6%** (25.6 T @ 2K) | ⚠️ **17× gap** (WMMA vs WGMMA) |
-| K2 | Larger tiles | 59.0% (423 T) | — | 🆕 not started |
-| K3 | Async loads (TMA) | 69.5% (498 T) | — | 🆕 not started |
-| K4 | Pushing tile size limit | 88.2% (632 T) | — | 🆕 not started |
-| K5 | Hide store latency | 92.1% (660 T) | — | 🆕 not started |
-| K6 | Faster barriers | 98.4% (705 T) | — | 🆕 not started |
-| K7 | Thread Block Clusters | **102.4%** (734 T) | — | 🆕 not started (surpasses cuBLAS!) |
-| K8 | Micro-optimizations | 104.3% (747 T) | — | 🆕 not started |
-| K9 | Async Stores | 105.8% (759 T) | — | 🆕 not started |
-| K10 | Hilbert Curves | 106.6% (764 T) | — | 🆕 not started |
+| Step | Technique | File | Pranjal | Ours | Status |
+|---|---|---|---|---|---|
+| — | Simon's FP32 (H100) | — | 4.4% (31.8 T) | 4.6% (32.9 T @ 4K) | ✅ Beat Simon |
+| K1 | **Tensor Core** | [`matmul_wmma.cu`](matmul_wmma.cu) (ours) | **44.3%** (317.6 T) | **2.6%** (25.6 T @ 2K) | ⚠️ **17× gap** |
+| K2 | Larger tiles | 🆕 | 59.0% (423 T) | — | |
+| K3 | Async loads (TMA) | 🆕 | 69.5% (498 T) | — | |
+| K4 | Pushing tile size limit | 🆕 | 88.2% (632 T) | — | |
+| K5 | Hide store latency | 🆕 | 92.1% (660 T) | — | |
+| K6 | Faster barriers | 🆕 | 98.4% (705 T) | — | |
+| K7 | Thread Block Clusters | 🆕 | **102.4%** (734 T) | — | Surpasses cuBLAS! |
+| K8 | Micro-optimizations | 🆕 | 104.3% (747 T) | — | |
+| K9 | Async Stores | 🆕 | 105.8% (759 T) | — | |
+| K10 | Hilbert Curves | 🆕 | 106.6% (764 T) | — | |
+
+Also available: [`matmul_wmma_bf16.cu`](matmul_wmma_bf16.cu) (WMMA BF16 variant), [`matmul_cublas_bf16.cu`](matmul_cublas_bf16.cu) (cuBLAS BF16 baseline).
 
 ### The API Gap (Why K1 = 17×)
 
@@ -82,10 +87,6 @@ Even at 100% vs cuBLAS FP32 on H100, we'd only reach ~52 TFLOPS. Tensor Cores of
 | Nsight profile | Not published | Memory 93%, Compute 17% — TC starving |
 
 Switching from WMMA to WGMMA is expected to close most of the 17× gap in a single change. Every subsequent step (TMA, pipelining, clusters) builds on WGMMA.
-
-### Our cuBLAS BF16 (reference)
-
-At N=2048: **287 TFLOPS (58% MFU)** — not directly comparable to Pranjal's N=4096 baseline of 717 TFLOPS. We need to benchmark at N=4096 for apples-to-apples.
 
 ---
 
