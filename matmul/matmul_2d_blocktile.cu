@@ -249,7 +249,7 @@ void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
             cudaEventDestroy(e);
         }
     };
-    cudaEvent_t start, stop;
+    cudaEvent_t start = nullptr, stop = nullptr;
     EventGuard guard(start, stop);
 
     int best_idx = -1;
