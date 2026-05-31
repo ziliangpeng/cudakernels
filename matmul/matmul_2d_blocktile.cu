@@ -143,7 +143,7 @@ Matmul2DBlocktile::~Matmul2DBlocktile() {}
 //   - NUM_THREADS = (BM/TM) * (BN/TN) <= 1024 (CUDA hard limit)
 //   - NUM_THREADS divides BM*BK (A tile load)
 //   - NUM_THREADS divides BK*BN (B tile load)
-//   - 2 * (BM*BK + BK*BN) * 4 bytes <= 228KB SMEM (H100)
+//   - (BM*BK + BK*BN) * 4 bytes <= 228KB SMEM (H100; single-buffered)
 //   - TM*TN + TM + TN <= ~96 (rough register budget)
 //
 // The sweep itself catches any post-warmup CUDA errors and skips those configs.
@@ -153,26 +153,32 @@ struct Candidate2D {
 };
 
 static const Candidate2D CANDIDATES_2D[] = {
-    // {BM, BN, BK, TM, TN}
-    {128, 128,  8,  8,  8},   // [ 0] CURRENT DEFAULT — 256 threads, 64 acc, 16KB SMEM
-    { 64,  64,  8,  8,  8},   //  [ 1] smaller block — 64 threads, more blocks/SM
-    {128, 128,  8, 16,  8},   //  [ 2] bigger TM — 128 threads, 128 acc
-    {128, 128,  8,  8, 16},   //  [ 3] bigger TN — 128 threads, 128 acc
-    {128, 128, 16,  8,  8},   //  [ 4] deeper BK — 32KB SMEM, fewer K-iters
-    {128,  64,  8,  8,  8},   //  [ 5] asymmetric (tall) — 128 threads
-    { 64, 128,  8,  8,  8},   //  [ 6] asymmetric (wide) — 128 threads
-    {128, 128,  8,  4,  4},   //  [ 7] small thread tile — 1024 threads, 16 acc
-    {256, 128,  8, 16,  8},   //  [ 8] bigger block (tall) — 128 threads, 24KB SMEM
-    {128, 256,  8,  8, 16},   //  [ 9] bigger block (wide) — 128 threads, 24KB SMEM
-    {128, 128, 16, 16,  8},   // [10] deepest BK + bigger TM — 128 threads, 32KB SMEM
+    // {BM, BN, BK, TM, TN}  SMEM = (BM*BK + BK*BN)*4 bytes (single-buffered)
+    {128, 128,  8,  8,  8},   // [ 0] CURRENT DEFAULT — 256 thr, 64 acc, 8KB SMEM
+    { 64,  64,  8,  8,  8},   // [ 1] smaller block — 64 thr, 4KB SMEM, more blocks/SM
+    {128, 128,  8, 16,  8},   // [ 2] bigger TM — 128 thr, 128 acc, 8KB SMEM
+    {128, 128,  8,  8, 16},   // [ 3] bigger TN — 128 thr, 128 acc, 8KB SMEM
+    {128, 128, 16,  8,  8},   // [ 4] deeper BK — 16KB SMEM, fewer K-iters
+    {128,  64,  8,  8,  8},   // [ 5] asymmetric (tall) — 128 thr, 6KB SMEM
+    { 64, 128,  8,  8,  8},   // [ 6] asymmetric (wide) — 128 thr, 6KB SMEM
+    {128, 128,  8,  4,  4},   // [ 7] small thread tile — 1024 thr, 16 acc, 8KB SMEM
+    {256, 128,  8, 16,  8},   // [ 8] bigger block (tall) — 128 thr, 12KB SMEM
+    {128, 256,  8,  8, 16},   // [ 9] bigger block (wide) — 128 thr, 12KB SMEM
+    {128, 128, 16, 16,  8},   // [10] deepest BK + bigger TM — 128 thr, 16KB SMEM
     // --- Grid expansion v2 (informed by first sweep) ---
     // First sweep showed winners cluster around (large TM, deeper BK).
     // These probes test how far that trend extrapolates before hitting other
     // resource walls (SMEM port pressure, register count, K-loop overhead).
-    {256, 128, 16, 16,  8},   // [11] push #10 winner to bigger block (tall)
-    {128, 128, 32, 16,  8},   // [12] does BK=32 keep winning, or oversaturate?
-    {128, 128, 16,  8, 16},   // [13] mirror of #10 — TM↔TN swap, same total reuse
-    {256, 256, 16, 16,  8},   // [14] big square block + deepest BK + best TM/TN
+    {256, 128, 16, 16,  8},   // [11] push #10 winner to bigger block (tall) — 24KB SMEM
+    {128, 128, 32, 16,  8},   // [12] does BK=32 keep winning, or oversaturate? — 32KB SMEM
+    {128, 128, 16,  8, 16},   // [13] mirror of #10 — TM↔TN swap, same total reuse — 16KB SMEM
+    {256, 256, 16, 16,  8},   // [14] big square block + deepest BK + best TM/TN — 32KB SMEM
+    // --- Grid expansion v3 (after SMEM math fix; we had been overestimating SMEM 2x,
+    //     so larger blocks are actually well within the 228KB limit) ---
+    {256, 128, 24, 16,  8},   // [15] deeper BK + larger block (tall) — 36KB SMEM
+    {256, 128, 32, 16,  8},   // [16] BK=32 on larger block — 48KB SMEM
+    {128, 128, 24, 16,  8},   // [17] BK between 16 and 32 — 24KB SMEM
+    {256, 256,  8, 16,  8},   // [18] big square block, shallow BK — 16KB SMEM
 };
 static const int NUM_CANDIDATES_2D = sizeof(CANDIDATES_2D) / sizeof(CANDIDATES_2D[0]);
 
@@ -205,6 +211,10 @@ void Matmul2DBlocktileAuto::launch(const float *d_A, const float *d_B, float *d_
     DISPATCH(128, 128, 32, 16,  8)
     DISPATCH(128, 128, 16,  8, 16)
     DISPATCH(256, 256, 16, 16,  8)
+    DISPATCH(256, 128, 24, 16,  8)
+    DISPATCH(256, 128, 32, 16,  8)
+    DISPATCH(128, 128, 24, 16,  8)
+    DISPATCH(256, 256,  8, 16,  8)
 
     #undef DISPATCH
 
@@ -232,8 +242,10 @@ void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
         if (BM % TM != 0 || BN % TN != 0) continue;        // thread tile divides block tile
         if ((BM * BK) % threads_per_block != 0) continue;  // strided A load divides cleanly
         if ((BK * BN) % threads_per_block != 0) continue;  // strided B load divides cleanly
-        // SMEM check: 2 * (BM*BK + BK*BN) * sizeof(float) <= 228KB
-        int smem_bytes = 2 * (BM * BK + BK * BN) * sizeof(float);
+        // SMEM check: (BM*BK + BK*BN) * sizeof(float) <= 228KB
+        // Kernel is single-buffered (As and Bs are reused each K-loop iteration
+        // with __syncthreads as the barrier), so no factor of 2.
+        int smem_bytes = (BM * BK + BK * BN) * sizeof(float);
         if (smem_bytes > 228 * 1024) continue;
         // Boundary fairness: skip non-divisible N (autotune timing is biased by
         // partial-tile branches; benchmark sizes are powers of 2 anyway).
