@@ -723,6 +723,23 @@ NEW:
 
 We've now beaten Simon's autotuned warptile running on H100 (31.8 TFLOPS) — without autotuning. This is also the first kernel to clear 60% of cuBLAS FP32.
 
+### Autotune result (2026-05-31)
+
+Implemented `MatmulVectorizedAuto` (see `matmul_vectorized.cu`) — first time `execute()` is called, sweeps 16 `(BM, BN, BK, TM, TN)` candidates and caches the best. Same structure as 2D blocktile (non-transposed `As[BM][BK]`, strided scalar loads) plus float4 (128-bit) C stores.
+
+Performance comparison at N=4096 (idle pi1-h100-16, 3-run median):
+
+| Variant | Config | N=4096 TFLOPS | vs cuBLAS FP32 |
+|---|---|---|---|
+| `vectorized` (hardcoded baseline) | `(128, 128, 8, 8, 8)` | 32.7 T | 62.7% |
+| **`vectorized_auto` (winning config)** | **`(128, 128, 16, 16, 8)`** | **34.8 T** | **66.7%** |
+| Delta | — | **+2.1T (+6.4%)** | **+4.0pp** |
+| `2d_blocktile_auto` (prev winner) | `(128, 128, 16, 16, 8)` | 33.7 T | 64.6% |
+
+Same winning config as 2D blocktile autotune (`(128, 128, 16, 16, 8)`). The float4 stores add +1.1T (+3.3%) on top of 2D auto's scalar stores — a modest but real win from reducing L1 cache-sector transactions during C writeback.
+
+Notably candidates [1] (BK=8, TM=16, TN=8) and [13] (256×128, BK=16, TM=16, TN=8) also hit ~32.4T+, confirming the autotune space is well-sampled with a clear single peak. The minor gap between candidates [1] and [4] (BK=16 → TM=16/TN=8) mirrors what 2D autotune saw: deeper BK wins on H100 until SMEM occupancy saturates.
+
 ### What we learned
 
 > **Vectorized GMEM (`float4`) cuts memory instruction count 4×, freeing the LSU. Transposing A in SMEM eliminates the bank conflicts that became visible once GMEM was no longer the dominant cost. The two changes only achieve their full +47% when bundled together.**
