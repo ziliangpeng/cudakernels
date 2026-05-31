@@ -387,7 +387,10 @@ void MatmulVectorizedAuto::tune(const float *d_A, const float *d_B, float *d_C) 
         if (threads_per_block % BK != 0) continue;
         if (threads_per_block % BN != 0) continue;
         if (TN % 4 != 0) continue;  // float4 store alignment
-        int smem_bytes = (BM * BK + BK * BN) * sizeof(float);
+        // SMEM = As[BM][BK+1] + Bs[BK][BN]; the +1 is the bank-conflict pad.
+        // Without the pad term, candidates near the 48KB ceiling could pass
+        // this static check but fail at launch.
+        int smem_bytes = (BM * (BK + 1) + BK * BN) * sizeof(float);
         if (smem_bytes > 48 * 1024) continue;
         if (N % BM != 0 || N % BN != 0) continue;
 
