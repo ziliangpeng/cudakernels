@@ -491,17 +491,17 @@ Implemented `Matmul2DBlocktileAuto` (see `matmul_2d_blocktile.cu`). 15-candidate
 | # | BM | BN | BK | TM | TN | Threads | SMEM | TFLOPS |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16KB** | **33.73** |
-| 2 | 128 | 128 | 8 | 16 | 8 | 128 | 16KB | 32.84 |
-| 11 | 256 | 128 | 16 | 16 | 8 | 256 | 48KB | 31.77 |
-| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 24KB | 29.23 |
-| 4 | 128 | 128 | 16 | 8 | 8 | 256 | 32KB | 28.89 |
-| 13 | 128 | 128 | 16 | 8 | **16** | 128 | 32KB | 23.96 |
-| 0 (default) | 128 | 128 | 8 | 8 | 8 | 256 | 16KB | 22.45 |
-| 12 | 128 | 128 | **32** | 16 | 8 | 128 | 64KB | 22.17 |
-| 7 | 128 | 128 | 8 | 4 | 4 | 1024 | 16KB | 21.65 |
+| 2 | 128 | 128 | 8 | 16 | 8 | 128 | 8KB | 32.40 |
+| 11 | 256 | 128 | 16 | 16 | 8 | 256 | 24KB | 31.54 |
+| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12KB | 29.02 |
+| 4 | 128 | 128 | 16 | 8 | 8 | 256 | 16KB | 28.55 |
+| 13 | 128 | 128 | 16 | 8 | **16** | 128 | 16KB | 23.74 |
+| 0 (default) | 128 | 128 | 8 | 8 | 8 | 256 | 8KB | 22.24 |
+| 12 | 128 | 128 | **32** | 16 | 8 | 128 | 32KB | 22.47 |
+| 7 | 128 | 128 | 8 | 4 | 4 | 1024 | 8KB | 21.50 |
 | 14 | 256 | 256 | 16 | 16 | 8 | 512 | — | SKIPPED (register spill) |
 
-(Full 15-row table in [`autotune.md`](autotune.md).)
+(Full 19-row table in [`autotune.md`](autotune.md).)
 
 **Default vs Best**:
 
@@ -509,7 +509,7 @@ Implemented `Matmul2DBlocktileAuto` (see `matmul_2d_blocktile.cu`). 15-candidate
 |---|---|---|---|
 | `(BM, BN, BK, TM, TN)` | `(128, 128, 8, 8, 8)` | `(128, 128, 16, 16, 8)` | — |
 | Threads per block | 256 | 128 | ½× |
-| SMEM per block | 16 KB | 32 KB | 2× |
+| SMEM per block | 8 KB | 16 KB | 2× |
 | Outputs per thread | 64 | 128 | 2× |
 | Register accumulators / thread | 64 | 128 | 2× |
 | K-loop iterations (N=4096) | 512 | 256 | ½× |

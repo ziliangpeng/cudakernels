@@ -2,6 +2,7 @@
 #include "cuda_utils.h"
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstdlib>
 
 // ============================================================================
 // Templated 2D Block Tiling kernel
@@ -219,8 +220,14 @@ void Matmul2DBlocktileAuto::launch(const float *d_A, const float *d_B, float *d_
 
     #undef DISPATCH
 
+    // Unsupported config — terminate immediately. A silent return would leave
+    // cudaEvent timers with stale near-zero values and cause the autotuner to
+    // falsely rank an unlaunched config as "best". Mismatch between the
+    // CANDIDATES_2D table and this DISPATCH list is a programming error that
+    // should be caught loudly, not papered over with print + return.
     fprintf(stderr, "[Matmul2DBlocktileAuto] Unsupported config: BM=%d BN=%d BK=%d TM=%d TN=%d\n",
             BM, BN, BK, TM, TN);
+    exit(EXIT_FAILURE);
 }
 
 void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C) {
