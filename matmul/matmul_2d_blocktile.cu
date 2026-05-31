@@ -47,27 +47,26 @@ __global__ void matmul2DBlocktileKernelT(const float *A, const float *B, float *
     const int innerColB = threadIdx.x % BN;
 
     for (int tileIdx = 0; tileIdx < N; tileIdx += BK) {
-        // Load A tile (strided)
+        // Load A tile (strided). For each candidate we ensure strideA divides BM,
+        // so loadOffset never exceeds BM and no inner row-bounds check is needed.
+        #pragma unroll
         for (int loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
             int row = innerRowA + loadOffset;
-            if (row < BM) {
-                if (blockRow * BM + row < N && tileIdx + innerColA < N) {
-                    As[row][innerColA] = A[row * N + innerColA];
-                } else {
-                    As[row][innerColA] = 0.0f;
-                }
+            if (blockRow * BM + row < N && tileIdx + innerColA < N) {
+                As[row][innerColA] = A[row * N + innerColA];
+            } else {
+                As[row][innerColA] = 0.0f;
             }
         }
 
-        // Load B tile (strided)
+        // Load B tile (strided). strideB divides BK by candidate validity.
+        #pragma unroll
         for (int loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
             int row = innerRowB + loadOffset;
-            if (row < BK) {
-                if (tileIdx + row < N && blockCol * BN + innerColB < N) {
-                    Bs[row][innerColB] = B[row * N + innerColB];
-                } else {
-                    Bs[row][innerColB] = 0.0f;
-                }
+            if (tileIdx + row < N && blockCol * BN + innerColB < N) {
+                Bs[row][innerColB] = B[row * N + innerColB];
+            } else {
+                Bs[row][innerColB] = 0.0f;
             }
         }
 
