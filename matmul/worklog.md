@@ -292,3 +292,153 @@ HBM tile  →  SMEM tile  →  Register tile  →  Tensor Core fragment
 ```
 
 Each level of tiling unlocks reuse at the next level of the hierarchy. CUTLASS systematizes this: every tile size is a template parameter. WGMMA / Tensor Core kernels add one more layer (the fragment tile fed to `wgmma.mma_async`). Same idea, more layers — every extra tile level absorbs another bandwidth bottleneck.
+
+---
+
+## Step 5: 2D Blocktile — Register Reuse on Both A and B (Outer Product)
+
+**File**: [`matmul_2d_blocktile.cu`](matmul_2d_blocktile.cu) | **Class**: `Matmul2DBlocktile`
+
+### Core insight: 1D only reused B in registers. 2D reuses A too.
+
+Recall 1D blocktile's inner loop:
+
+```c
+// 1D — only B is reused at register level
+for (int dotIdx = 0; dotIdx < 8; dotIdx++) {
+    float tmpB = Bs[dotIdx][threadCol];           // ← 1 B value in register
+    for (int resIdx = 0; resIdx < 8; resIdx++) {
+        threadResults[resIdx] +=
+            As[threadRow*8 + resIdx][dotIdx]      // ← 8 fresh SMEM reads of A
+            * tmpB;
+    }
+}
+// 1 B SMEM read + 8 A SMEM reads = 9 SMEM reads → 8 madds
+```
+
+`tmpB` is held in a register and reused 8 times. Good. **But A is still read fresh from SMEM on every madd.** The SMEM-port pressure from A is still 1 read per madd — the same problem we solved for B is still alive on the A side.
+
+2D blocktile fixes this by also pulling A's 8 values into registers, then doing an outer product:
+
+```c
+// 2D — both A and B held in registers, every madd is register-only
+for (int dotIdx = 0; dotIdx < 8; dotIdx++) {
+    // ① Load 8 A values into registers (one SMEM read each)
+    for (int i = 0; i < TM; i++)
+        regA[i] = As[threadRow*TM + i][dotIdx];   // 8 SMEM reads
+
+    // ② Load 8 B values into registers
+    for (int j = 0; j < TN; j++)
+        regB[j] = Bs[dotIdx][threadCol*TN + j];   // 8 SMEM reads
+
+    // ③ Outer product — 64 madds, all register-only
+    for (int i = 0; i < TM; i++)
+        for (int j = 0; j < TN; j++)
+            threadResults[i][j] += regA[i] * regB[j];
+}
+// 16 SMEM reads → 64 madds  (4× the arithmetic intensity of 1D)
+```
+
+### Outer product — why both sides get reused
+
+For a fixed `dotIdx`, the 8 A values and 8 B values combine into an 8×8 outer product:
+
+```
+            regB[0..7]  ← 8 B values
+           ┌──────────────────────┐
+           │ b0  b1  b2 ... b7    │
+           └──────────────────────┘
+
+regA       threadResults[8][8]
+[a0]       ┌──────────────────────┐
+[a1]       │ a0·b0  a0·b1 ... a0·b7│   ← regA[0] reused across 8 columns
+[a2]       │ a1·b0  a1·b1 ... a1·b7│   ← regA[1] reused across 8 columns
+[..]   →   │   ...                │
+[a7]       │ a7·b0  a7·b1 ... a7·b7│
+           └──────────────────────┘
+            ↑ regB[0] reused across 8 rows
+```
+
+Each `regA[i]` is multiplied against 8 different `regB[j]` values. Each `regB[j]` is multiplied against 8 different `regA[i]` values. **Both sides are reused 8 times → total reuse factor = 8 × 8 = 64.**
+
+### Configuration
+
+```
+BM=128, BN=128, BK=8           ← block tile is 4× bigger than 1D
+TM=8,   TN=8                    ← thread tile is now 8×8, not 8×1
+256 threads/block               ← (128/8) × (128/8) = 16 × 16
+threadResults[8][8]             ← 64 accumulators per thread (in registers)
+regA[8], regB[8]                ← 16 input registers per thread
+```
+
+Each thread now owns a TM × TN = 8 × 8 = **64-element output square** of the block tile, instead of a 8 × 1 column slice.
+
+### Memory hierarchy: where reuse happens
+
+```
+SMEM / L1 (block-level reuse — same as before)
+   │
+   │  Each iteration:
+   │   - load 8 A values into regA[]  ← 8 SMEM reads
+   │   - load 8 B values into regB[]  ← 8 SMEM reads
+   ▼
+Register File (thread-level reuse — BOTH A AND B)
+   │
+   │  Outer product:
+   │   for i in 0..7:
+   │     for j in 0..7:
+   │       threadResults[i][j] += regA[i] * regB[j]
+   │   → regA[i] reused 8 times (across j)
+   │   → regB[j] reused 8 times (across i)
+   │   → 64 madds from 16 SMEM reads
+   ▼
+threadResults[8][8] accumulators (in registers)
+```
+
+### Arithmetic intensity comparison
+
+| Kernel | SMEM reads per inner iteration | madds per inner iteration | madd / SMEM read | What's reused in registers |
+|---|---|---|---|---|
+| SMEM | 2 (1A + 1B) | 1 | 0.50 | nothing |
+| 1D blocktile | 9 (8A + 1B) | 8 | 0.89 | B only |
+| **2D blocktile** | **16 (8A + 8B)** | **64** | **4.00** | **both A and B** |
+
+SMEM-port pressure per madd: 2.0 (SMEM) → 1.12 (1D) → **0.25** (2D). That's an **8× reduction** vs SMEM kernel, with the same SMEM tile load pattern.
+
+### Performance
+
+| Kernel | TFLOPS | % vs cuBLAS FP32 | Improvement |
+|---|---|---|---|
+| 1D blocktile | 17.6 T | 33.7% | — |
+| **2D blocktile** | **22.4 T** | **42.9%** | **+27%** |
+
+The jump from 1D to 2D is smaller than from SMEM to 1D, because we already extracted most of the value at the first level of register reuse. But it confirms the principle: every additional dimension of register reuse buys real throughput.
+
+### Why the load phase looks more complicated
+
+256 threads must cover BM × BK = 128 × 8 = 1024 A elements (and 1024 B elements). That's 4 elements per thread. The kernel uses a strided load pattern:
+
+```c
+const int strideA = NUM_THREADS_2D / BK_2D;   // 256/8 = 32
+for (int loadOffset = 0; loadOffset < BM_2D; loadOffset += strideA) {
+    int row = innerRowA + loadOffset;
+    As[row][innerColA] = A[row * N + innerColA];
+}
+```
+
+Each thread loads 4 rows that are 32 apart, so within any single iteration of the `loadOffset` loop, the 32 threads of a warp all read the same row at consecutive columns — that's a coalesced 128B GMEM transaction. This separation between *load indexing* (`innerRowA`, `innerColA`) and *compute indexing* (`threadRow`, `threadCol`) is what lets us decouple "how many threads share the work of loading" from "how the thread tile is shaped in the output".
+
+### What we learned
+
+> **1D blocktile reuses B in registers (8 madds per SMEM read).
+> 2D blocktile reuses BOTH A and B in registers via outer product (64 madds per SMEM read).
+> Reuse factor = TM × TN. Every additional register-tile dimension multiplies the arithmetic intensity.**
+
+The general pattern is now clear:
+
+- **No register tile** (SMEM kernel): madd/read = 0.5
+- **1D register tile** (TM=8): madd/read = TM / (TM+1) ≈ 1
+- **2D register tile** (TM=8, TN=8): madd/read = TM·TN / (TM+TN) = 64/16 = 4
+- **Tensor Core fragment** (16×16 or larger): madd/read = even higher
+
+Going bigger on the thread tile (TM, TN) increases arithmetic intensity but also increases register pressure (TM×TN accumulators + TM + TN input registers). At some point you run out of registers per thread and occupancy collapses. The sweet spot for FP32 H100 is around TM=TN=8 (64 accumulators); WGMMA Tensor Core kernels push this to 64×N because the Tensor Core fragment itself replaces the inner 8×8 outer product with a single hardware instruction.
