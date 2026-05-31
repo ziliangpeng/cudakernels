@@ -127,28 +127,28 @@ Matmul1DBlocktile::~Matmul1DBlocktile() {}
 //   - thread tile     (TM):    4, 8, or 16
 
 struct Candidate {
-    int BM, BN, BK, TM;
+    int BM, BK, TM;
 };
 
-// 13 candidates — 4K-friendly mix of small/medium/large tiles.
+// IMPORTANT — constraint of the current kernel:
+//   The kernel uses 1-element-per-thread load with
+//     innerRowA = tid / BK, innerColA = tid % BK,  (covers BM*BK elements)
+//     innerRowB = tid / BN, innerColB = tid % BN.  (covers BK*BN elements)
+//   For correctness we therefore need:
+//     NUM_THREADS == (BM*BN)/TM == BM*BK == BK*BN
+//   which implies BM == BN and BM == BK*TM.
+//
+// Valid candidates satisfying this constraint:
+
 static const Candidate CANDIDATES[] = {
-    // Small / current baseline
-    { 64,  64,  8,  8},   // [0] current default (16,896 threads/block? -> (64*64)/8 = 512)
-    { 64,  64, 16,  8},   // [1] deeper BK
-    { 64,  64,  8,  4},   // [2] smaller TM (more threads)
-    { 64,  64,  8, 16},   // [3] larger TM (fewer threads)
-    // Asymmetric
-    { 64, 128,  8,  8},   // [4] wider BN
-    {128,  64,  8,  8},   // [5] taller BM
-    {128,  64,  8, 16},   // [6] taller BM + larger TM
-    { 64, 128,  8, 16},   // [7] wider BN + larger TM
-    // Medium
-    {128, 128,  8,  8},   // [8] balanced big tile
-    {128, 128, 16,  8},   // [9] balanced big tile + deeper BK
-    // 4K-friendly larger tiles (these explore bigger thread tiles + asymmetric)
-    {256, 128,  8, 16},   // [10] tall big tile
-    {128, 256,  8, 16},   // [11] wide big tile
-    {256, 128, 16, 16},   // [12] tall big tile + deeper BK
+    // {BM = BN, BK, TM}  threads = BM*BK
+    { 32,  4,  8},   // [0] tiny, 256 threads
+    { 32,  8,  4},   // [1] tiny, 256 threads (smaller TM = more outputs/block)
+    { 64,  4, 16},   // [2] small block, large thread tile, 256 threads
+    { 64, 16,  4},   // [3] small block, small thread tile, 256 threads
+    { 64,  8,  8},   // [4] CURRENT DEFAULT (baseline), 512 threads
+    {128,  8, 16},   // [5] big block, large thread tile, 1024 threads
+    {128, 16,  8},   // [6] big block + deeper BK, 1024 threads
 };
 static const int NUM_CANDIDATES = sizeof(CANDIDATES) / sizeof(CANDIDATES[0]);
 
@@ -166,19 +166,13 @@ void Matmul1DBlocktileAuto::launch(const float *d_A, const float *d_B, float *d_
             return; \
         }
 
+    DISPATCH( 32,  32,  4,  8)
+    DISPATCH( 32,  32,  8,  4)
+    DISPATCH( 64,  64,  4, 16)
+    DISPATCH( 64,  64, 16,  4)
     DISPATCH( 64,  64,  8,  8)
-    DISPATCH( 64,  64, 16,  8)
-    DISPATCH( 64,  64,  8,  4)
-    DISPATCH( 64,  64,  8, 16)
-    DISPATCH( 64, 128,  8,  8)
-    DISPATCH(128,  64,  8,  8)
-    DISPATCH(128,  64,  8, 16)
-    DISPATCH( 64, 128,  8, 16)
-    DISPATCH(128, 128,  8,  8)
+    DISPATCH(128, 128,  8, 16)
     DISPATCH(128, 128, 16,  8)
-    DISPATCH(256, 128,  8, 16)
-    DISPATCH(128, 256,  8, 16)
-    DISPATCH(256, 128, 16, 16)
 
     #undef DISPATCH
 
@@ -201,30 +195,25 @@ void Matmul1DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
 
     for (int i = 0; i < NUM_CANDIDATES; i++) {
         Candidate c = CANDIDATES[i];
-        int threads_per_block = (c.BM * c.BN) / c.TM;
-        if (threads_per_block > 1024) continue;  // CUDA hard limit
-        if (c.BM % c.TM != 0) continue;          // divisibility
-        // For correctness with the current kernel we require N % BM == 0 and N % BN == 0.
-        // The kernel itself does have boundary checks, but autotune skips these to keep
-        // perf comparisons fair (boundary-handling branches change timing).
-        if (N % c.BM != 0 || N % c.BN != 0) continue;
+        int BM = c.BM, BN = c.BM, BK = c.BK, TM = c.TM;  // BN == BM by constraint
+        int threads_per_block = (BM * BN) / TM;
+        if (threads_per_block > 1024) continue;
+        if (BM % TM != 0) continue;
+        if (N % BM != 0 || N % BN != 0) continue;
 
-        // Warmup
         for (int w = 0; w < 2; w++) {
-            launch(d_A, d_B, d_C, c.BM, c.BN, c.BK, c.TM);
+            launch(d_A, d_B, d_C, BM, BN, BK, TM);
         }
         cudaDeviceSynchronize();
 
-        // Measure: 3 timed runs, take median
         float times[3];
         for (int t = 0; t < 3; t++) {
             cudaEventRecord(start);
-            launch(d_A, d_B, d_C, c.BM, c.BN, c.BK, c.TM);
+            launch(d_A, d_B, d_C, BM, BN, BK, TM);
             cudaEventRecord(stop);
             cudaEventSynchronize(stop);
             cudaEventElapsedTime(&times[t], start, stop);
         }
-        // Tiny inline median-of-3 (sort)
         if (times[0] > times[1]) { float t = times[0]; times[0] = times[1]; times[1] = t; }
         if (times[1] > times[2]) { float t = times[1]; times[1] = times[2]; times[2] = t; }
         if (times[0] > times[1]) { float t = times[0]; times[0] = times[1]; times[1] = t; }
@@ -232,7 +221,7 @@ void Matmul1DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
 
         double tflops = (2.0 * (double)N * N * N) / (median * 1e9);
         printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d  thr=%4d  ->  %.3f ms  (%.2f TFLOPS)\n",
-               i, c.BM, c.BN, c.BK, c.TM, threads_per_block, median, tflops);
+               i, BM, BN, BK, TM, threads_per_block, median, tflops);
 
         if (median < best_ms) {
             best_ms = median;
@@ -245,7 +234,7 @@ void Matmul1DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
 
     Candidate best = CANDIDATES[best_idx];
     best_BM = best.BM;
-    best_BN = best.BN;
+    best_BN = best.BM;  // BN == BM by constraint
     best_BK = best.BK;
     best_TM = best.TM;
     best_time_ms = best_ms;
