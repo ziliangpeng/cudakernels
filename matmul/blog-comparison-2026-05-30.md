@@ -14,7 +14,7 @@
 
 | | cuBLAS FP32 2K H100 | cuBLAS FP32 4K H100 | cuBLAS FP32 (Simon A100) |
 |---|---|---|---|
-| Baseline | 50.4 TFLOPS | 52.2 TFLOPS | 23.2 TFLOPS (A100) |
+| Baseline | 50.4 TFLOPS | 51.9 TFLOPS | 23.2 TFLOPS (A100) |
 | Source | [`matmul_cublas.cu`](matmul_cublas.cu) | same | — |
 
 Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autotunes.
@@ -41,7 +41,9 @@ Each `link` in the Src column points to the corresponding `matmul_<step>.cu` fil
 
 **2D blocktile autotune (2026-05-30, updated)**: 2D blocktile autotuned across 19 candidates (initial 11 + 4 expansion + 4 v3 after the SMEM math fix). Best config = `BM=BN=128, BK=16, TM=16, TN=8` (128 threads, 8×16 thread tile), **34.0 TFLOPS @ N=4096 — +52% over the hardcoded baseline (22.3 → 34.0)**. We now nearly match Simon's autotuned A100 2D blocktile (65.2% vs 68.7%) and **beat Simon's autotuned warptile when run on H100** (65.2% vs 60.9%). Three lessons: (a) BK=16 is a sweet spot, not a "deeper is better" ladder; (b) **TM and TN are NOT mirror-symmetric** — `(TM=16, TN=8)` runs 30% faster than the swapped `(TM=8, TN=16)`, because the compiler hoists `regA[i]` and longer TN causes register-allocation pressure; (c) once SM occupancy saturates, bigger blocks just add SMEM bloat without buying parallelism. Gemini Code Assist caught two real bugs in the autotuner's validity check during PR review (SMEM 2× over-count, and missing `NUM_THREADS % BK == 0` divisibility leading to silent OOB SMEM writes for BK=24 candidates — fixed in commit 38f8709). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 5 "Autotune result" for full details.
 
-**Vectorized autotune (2026-05-31)**: Vectorized kernel autotuned across 16 candidates using same structure as 2D blocktile (non-transposed As, strided scalar loads) plus float4 (128-bit) C stores. Same winner as 2D: `(BM=BN=128, BK=16, TM=16, TN=8)` at **34.8 TFLOPS @ N=4096 — +1.1T (+3.3%) over 2D blocktile autotune**. The float4 store alone adds measurable gain on H100 by reducing L1 cache-sector transactions during the C writeback phase. Total FP32 progress: naive 10.2% → 66.7% of cuBLAS FP32 (+56.5pp). See [`autotune.md`](autotune.md) Step 6 autotune section for details.
+**Vectorized autotune (2026-05-31)**: Vectorized kernel autotuned across 16 candidates using same structure as 2D blocktile (non-transposed As, strided scalar loads) plus float4 (128-bit) C stores. Same winner as 2D: `(BM=BN=128, BK=16, TM=16, TN=8)` at **34.7 TFLOPS @ N=4096 — +1.1T (+3.3%) over 2D blocktile autotune**. The float4 store alone adds measurable gain on H100 by reducing L1 cache-sector transactions during the C writeback phase. Total FP32 progress: naive 10.2% → 66.9% of cuBLAS FP32 (+56.7pp). See [`autotune.md`](autotune.md) Step 6 autotune section for details.
+
+**Verification run on exclusive node (2026-05-31, 3 trials)**: All numbers in Table 1 verified on `pi1-h100-27` (job 11723, `--gres=gpu:8 --exclusive`, OverSubscribe=NO). Run-to-run reproducibility is ±0.07T on the auto kernels; only run 1 shows the typical cold-cache warmup +0.2T edge. Earlier numbers in this doc came from `pi1-h100-16` which we later discovered was a shared dev-partition node — the salloc had no GPU TRES and we were opportunistically using a neighbor's idle Ray-worker GPUs. The shared-node numbers turned out to be within ±0.17T of the exclusive-node values, so the original measurements were not contaminated, but the methodology was loose. cuBLAS FP32 corrected 52.2 → 51.9T, cuBLAS BF16 corrected 485.5 → 493.6T (the +1.7% delta is the only one that exceeds noise).
 
 Shared infra: [`matmul.cpp`](matmul.cpp) (benchmark harness), [`matmul_kernel.h`](matmul_kernel.h) (base class), [`matrix_init.{h,cu}`](matrix_init.cu) (CPU reference).
 
@@ -71,7 +73,7 @@ Even at 100% vs cuBLAS FP32 on H100, we'd only reach ~52 TFLOPS. Tensor Cores of
 
 ## Table 2: Tensor Core Path — Ours vs Pranjal (H100 Worklog)
 
-**N=4096. Both vs cuBLAS BF16.** Pranjal's baseline = 716.7 TFLOPS, ours = 485.5 TFLOPS.
+**N=4096. Both vs cuBLAS BF16.** Pranjal's baseline = 716.7 TFLOPS, ours = 493.6 TFLOPS.
 
 | Step | Technique | File | Pranjal (4K) | Ours (4K) | Status |
 |---|---|---|---|---|---|
@@ -87,7 +89,7 @@ Even at 100% vs cuBLAS FP32 on H100, we'd only reach ~52 TFLOPS. Tensor Cores of
 | K9 | Async Stores | 🆕 | 105.8% (759 T) | — | |
 | K10 | Hilbert Curves | 🆕 | 106.6% (764 T) | — | |
 
-Also available: [`matmul_wmma_bf16.cu`](matmul_wmma_bf16.cu) (WMMA BF16 variant, 27.5T at 4K), [`matmul_cublas_bf16.cu`](matmul_cublas_bf16.cu) (cuBLAS BF16 baseline, 485.5T at 4K).
+Also available: [`matmul_wmma_bf16.cu`](matmul_wmma_bf16.cu) (WMMA BF16 variant, 27.6T at 4K), [`matmul_cublas_bf16.cu`](matmul_cublas_bf16.cu) (cuBLAS BF16 baseline, 493.6T at 4K).
 
 ### The API Gap (Why K1 = 7.8×)
 
