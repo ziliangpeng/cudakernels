@@ -269,6 +269,12 @@ void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
         // partial-tile branches; benchmark sizes are powers of 2 anyway).
         if (N % BM != 0 || N % BN != 0) continue;
 
+        // Clear any pre-existing CUDA error that might have leaked from prior
+        // setup (cudaMalloc, prior candidate's edge cases, cudaEventCreate, etc.)
+        // before we start warming up this candidate. This guarantees the
+        // post-warmup cudaGetLastError() below catches only this candidate's errors.
+        cudaGetLastError();
+
         // Warmup
         for (int w = 0; w < 2; w++) {
             launch(d_A, d_B, d_C, BM, BN, BK, TM, TN);
@@ -286,14 +292,27 @@ void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
             continue;
         }
 
-        // Measure: 3 timed runs, median
-        float times[3];
+        // Measure: 3 timed runs, median.
+        // Initialize to +inf so that if a cudaEvent API fails (returns non-zero),
+        // the uninitialized stack value can't be sorted as "fastest" and falsely
+        // win the candidate ranking. Same defense as the post-warmup error check.
+        float times[3] = {1e30f, 1e30f, 1e30f};
+        bool timing_failed = false;
         for (int t = 0; t < 3; t++) {
             cudaEventRecord(start);
             launch(d_A, d_B, d_C, BM, BN, BK, TM, TN);
             cudaEventRecord(stop);
-            cudaEventSynchronize(stop);
-            cudaEventElapsedTime(&times[t], start, stop);
+            if (cudaEventSynchronize(stop) != cudaSuccess ||
+                cudaEventElapsedTime(&times[t], start, stop) != cudaSuccess) {
+                timing_failed = true;
+                break;
+            }
+        }
+        if (timing_failed) {
+            printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d TN=%2d  thr=%4d  ->  SKIPPED (timing failed)\n",
+                   i, BM, BN, BK, TM, TN, threads_per_block);
+            cudaGetLastError();  // clear so it doesn't leak into next candidate
+            continue;
         }
         if (times[0] > times[1]) { float t = times[0]; times[0] = times[1]; times[1] = t; }
         if (times[1] > times[2]) { float t = times[1]; times[1] = times[2]; times[2] = t; }
