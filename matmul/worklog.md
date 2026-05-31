@@ -442,3 +442,147 @@ The general pattern is now clear:
 - **Tensor Core fragment** (16×16 or larger): madd/read = even higher
 
 Going bigger on the thread tile (TM, TN) increases arithmetic intensity but also increases register pressure (TM×TN accumulators + TM + TN input registers). At some point you run out of registers per thread and occupancy collapses. The sweet spot for FP32 H100 is around TM=TN=8 (64 accumulators); WGMMA Tensor Core kernels push this to 64×N because the Tensor Core fragment itself replaces the inner 8×8 outer product with a single hardware instruction.
+
+---
+
+## Step 6: Vectorized — `float4` Loads + Transposed A Tile
+
+**File**: [`matmul_vectorized.cu`](matmul_vectorized.cu) | **Class**: `MatmulVectorized`
+
+### Two changes bundled into one step
+
+This step packages **two independent optimizations** that compound:
+
+1. **`float4` vectorized GMEM loads and stores** — reduce instruction count for memory ops
+2. **A tile transposed in SMEM** — eliminate SMEM bank conflicts and enable vectorized SMEM reads
+
+Each one alone helps a little. Together they take us from 22.4T → 32.9T (**+47%, 63.0% vs cuBLAS FP32**).
+
+### Change 1: `float4` for HBM ↔ register
+
+Replace 4 scalar loads with 1 vector load:
+
+```c
+// Before — 4 instructions per thread to load 4 floats
+float a0 = A[idx + 0];
+float a1 = A[idx + 1];
+float a2 = A[idx + 2];
+float a3 = A[idx + 3];
+
+// After — 1 instruction loads all 4 floats
+float4 tmp = *reinterpret_cast<const float4*>(&A[idx]);
+```
+
+#### Why it helps
+
+For a warp loading 32 floats:
+
+| Method | Per-thread load | GMEM transactions | Instructions issued |
+|---|---|---:|---:|
+| Scalar `float` | 4 bytes | 1 × 128B per scalar load | 4 |
+| `float4` | 16 bytes | 1 × 128B per scalar-equivalent (same total bytes) | **1** |
+
+The total bytes moved are the same. The HBM-to-L2 path doesn't care which form you used. **What changes is the instruction count on the LSU** (Load/Store Unit). Each SM has only so many LSU pipes, and each pipe can issue one memory instruction per cycle. Cutting memory instructions 4× frees the LSU for compute or other memory ops in the same warp.
+
+A second effect: each L1/L2 request carries metadata overhead (address, mask, cache tag lookup). Fewer requests = less cache controller pressure even when the same bytes are moved.
+
+So vectorization is not about "moving more data" — it's about **issuing fewer instructions for the same data**.
+
+### Change 2: A tile transposed in SMEM
+
+```c
+// 2D blocktile: A stored as [BM][BK]
+__shared__ float As[BM_2D][BK_2D];        // [128][8]
+regA[i] = As[threadRow*8 + i][dotIdx];    // stride-8 access
+
+// Vectorized: A stored as [BK][BM] — transposed!
+__shared__ float As[BK_VEC][BM_VEC];      // [8][128]
+regA[i] = As[dotIdx][threadRow*8 + i];    // stride-1 access (contiguous)
+```
+
+The load phase writes A transposed into SMEM:
+
+```c
+// GMEM read: contiguous row of 4 floats
+float4 tmp = *(...)(&A[innerRowA * N + innerColA * 4]);
+
+// SMEM write: scatter the 4 values into 4 different rows of As
+As[innerColA * 4 + 0][innerRowA] = tmp.x;
+As[innerColA * 4 + 1][innerRowA] = tmp.y;
+As[innerColA * 4 + 2][innerRowA] = tmp.z;
+As[innerColA * 4 + 3][innerRowA] = tmp.w;
+```
+
+The compute phase then reads A's column from SMEM along a **contiguous** axis instead of strided.
+
+### Why transpose matters here (and not earlier)
+
+The most important conceptual point: **bank conflicts have been present since 2D blocktile, but only became the bottleneck after `float4` reduced GMEM instruction pressure.**
+
+Walking through each kernel's SMEM access pattern from the warp's point of view:
+
+| Step | A inner-loop access | Warp pattern | Bank conflict? | Why we didn't transpose |
+|---|---|---|---|---|
+| SMEM | `As[ty][k]` (ty=fixed in warp, k=fixed) | All 32 threads read the **same address** | None — pure broadcast | Not needed |
+| 1D blocktile | `As[threadRow*8+resIdx][dotIdx]` (threadRow fixed in warp because BN=64 > 32) | All 32 threads read the **same address** | None — pure broadcast | Not needed |
+| 2D blocktile | `As[threadRow*8+i][dotIdx]` (threadRow varies: warp spans 2 rows) | Warp splits into two 16-thread broadcast groups | 2-way conflict (mild) | Real but not the dominant bottleneck — GMEM instruction count and FP32 throughput were bigger limits |
+| Vectorized (`float4`) | `As[dotIdx][threadRow*8+i]` | 16+16 broadcasts at non-conflicting banks | None | Now we transpose because the previous limit (GMEM instructions) was removed by `float4`, exposing SMEM as the next layer to fix |
+
+#### Bank conflict mechanics in 2D blocktile
+
+`threadRow = threadIdx.x / 16`, so a 32-thread warp has 16 threads with threadRow=0 and 16 with threadRow=1. For a fixed `dotIdx` and `i`:
+
+- threadRow=0 group reads `As[0*8 + i][dotIdx]` — bank = `(0 + dotIdx) % 32`
+- threadRow=1 group reads `As[1*8 + i][dotIdx]` — bank = `(64 + dotIdx) % 32` = `dotIdx % 32`
+
+Both groups hit the **same SMEM bank**. SMEM bank conflicts serialize within a warp, so this is a 2-way conflict — the warp's SMEM read for A takes 2 cycles instead of 1. Not catastrophic; that's why 2D blocktile still hits 42.9% without fixing it.
+
+#### Why `float4` exposes the conflict
+
+Two things shift the bottleneck:
+
+1. **GMEM load instruction count drops 4×** — the LSU is no longer saturated by tile loads, so the compute inner loop becomes a larger fraction of total runtime.
+2. **The compute inner loop is dominated by SMEM reads** (16 reads → 64 madds). When the SMEM read takes 2 cycles instead of 1 due to bank conflict, that doubles the inner-loop SMEM time.
+
+After step (1) frees the LSU, step (2)'s SMEM bank conflicts move from "background noise" to "30%+ of inner-loop latency." Transposing the A tile (a few extra lines of code in the load phase) fixes it cleanly.
+
+### The general pattern: bottlenecks shift after each fix
+
+This is the most important meta-insight from this step:
+
+> **Optimization is layered. Fixing the current bottleneck reveals the next one. You don't fix everything at once because (a) you don't know which "issue" is actually a bottleneck until you've removed the larger ones, and (b) some optimizations only pay back after a prior layer is fixed.**
+
+If we had transposed A in step 4 (1D blocktile) or step 5 (2D blocktile), the gain would have been small or zero — bank conflicts weren't on the critical path yet. Adding the transpose logic also slightly complicates the load phase (the scatter to 4 different SMEM rows), so doing it prematurely would add code complexity for negligible benefit.
+
+This is the "premature optimization is the root of all evil" principle applied at the kernel level: **profile, find the true bottleneck, fix it, then re-profile to find the next one.**
+
+### Configuration
+
+```
+BM=128, BN=128, BK=8           ← same block tile as 2D blocktile
+TM=8,   TN=8                    ← same thread tile
+256 threads/block               ← same thread count
+
+NEW:
+  As[BK][BM]                    ← transposed (was As[BM][BK])
+  GMEM load: float4 (16-byte)   ← was scalar 4-byte
+  GMEM store: float4            ← was scalar 4-byte
+```
+
+### Performance
+
+| Kernel | TFLOPS | % vs cuBLAS FP32 | Improvement |
+|---|---|---|---|
+| 2D blocktile | 22.4 T | 42.9% | — |
+| **Vectorized** | **32.9 T** | **63.0%** | **+47%** |
+
+We've now beaten Simon's autotuned warptile running on H100 (31.8 TFLOPS) — without autotuning. This is also the first kernel to clear 60% of cuBLAS FP32.
+
+### What we learned
+
+> **Vectorized GMEM (`float4`) cuts memory instruction count 4×, freeing the LSU. Transposing A in SMEM eliminates the bank conflicts that became visible once GMEM was no longer the dominant cost. The two changes only achieve their full +47% when bundled together.**
+
+Two takeaways for future steps:
+
+1. **Whenever you reduce one resource's pressure (here: LSU instructions), re-evaluate where the next bottleneck sits.** What looked like a small SMEM bank conflict in step 5 became a measurable 30%+ of inner-loop time in step 6 — same code, different relative cost.
+2. **`float4` is universal** — every subsequent step (warptile, Tensor Core kernels) keeps `float4` GMEM loads. The transpose pattern also generalizes: any time SMEM access strides hit the same bank, transpose at the SMEM layout level rather than fix it at the indexing level.
