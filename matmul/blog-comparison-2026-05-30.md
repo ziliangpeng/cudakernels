@@ -27,12 +27,11 @@ Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autot
 | 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.5% (16.9 T) | 33.7% (17.6 T) | 36.5% (8.5 T) | −2.8pp ≈ |
 | **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | — | **36.9% (19.3 T)** | 36.5% (8.5 T) | **+0.4pp** ✅ |
 | 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (21.6 T) | 42.9% (22.4 T) | 68.7% (16.0 T) | **−25.8pp** ⚠️ |
-| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | — | **65.2% (34.0 T)** | 68.7% (16.0 T) | **−3.5pp** ✅ |
+| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | — | **65.2% (34.0 T)** | **84.8%** (19.7 T) | −19.6pp |
 | Vectorized | [link](matmul_vectorized.cu) | 65.1% (32.8 T) | 63.0% (32.9 T) | 78.4% (18.2 T) | −15.4pp |
 | **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | — | **66.7% (34.8 T)** | 78.4% (18.2 T) | −11.7pp |
 | Warptile | [link](matmul_warptile.cu) | 56.3% (28.4 T) | 54.2% (28.3 T) | **93.7%** (21.8 T) | **−39.5pp** ⚠️⚠️ |
 | **Warptile (autotuned)** | [link](matmul_warptile.cu) | — | **64.4% (33.4 T)** | 93.7% (21.8 T) | **−29.3pp** |
-| Autotuning | — | — | — | 84.8% (19.7 T) | — |
 
 Each `link` in the Src column points to the corresponding `matmul_<step>.cu` file in this directory.
 
@@ -40,7 +39,7 @@ Each `link` in the Src column points to the corresponding `matmul_<step>.cu` fil
 
 **Autotuning update (2026-05-30)**: 1D blocktile autotuned across 7 legal candidates (kernel constraint: BM = BN = BK·TM). Best config = `BM=BN=64, BK=4, TM=16` (256 threads, 16 outputs per thread), 19.26 TFLOPS @ N=4096 — **+9% over hardcoded baseline (17.6 → 19.3)**, just edging Simon's autotuned 1D blocktile on A100 (36.5% → 36.9%). The winning config is *not* siboehm's recommended `(64, 64, 8, 8)` — H100 prefers smaller BK + larger TM (more register reuse per thread). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 4 "Autotune result" section for full details.
 
-**2D blocktile autotune (2026-05-30, updated)**: 2D blocktile autotuned across 19 candidates (initial 11 + 4 expansion + 4 v3 after the SMEM math fix). Best config = `BM=BN=128, BK=16, TM=16, TN=8` (128 threads, 8×16 thread tile), **34.0 TFLOPS @ N=4096 — +52% over the hardcoded baseline (22.3 → 34.0)**. We now nearly match Simon's autotuned A100 2D blocktile (65.2% vs 68.7%) and **beat Simon's autotuned warptile when run on H100** (65.2% vs 60.9%). Three lessons: (a) BK=16 is a sweet spot, not a "deeper is better" ladder; (b) **TM and TN are NOT mirror-symmetric** — `(TM=16, TN=8)` runs 30% faster than the swapped `(TM=8, TN=16)`, because the compiler hoists `regA[i]` and longer TN causes register-allocation pressure; (c) once SM occupancy saturates, bigger blocks just add SMEM bloat without buying parallelism. Gemini Code Assist caught two real bugs in the autotuner's validity check during PR review (SMEM 2× over-count, and missing `NUM_THREADS % BK == 0` divisibility leading to silent OOB SMEM writes for BK=24 candidates — fixed in commit 38f8709). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 5 "Autotune result" for full details.
+**2D blocktile autotune (2026-05-30, updated)**: 2D blocktile autotuned across 19 candidates (initial 11 + 4 expansion + 4 v3 after the SMEM math fix). Best config = `BM=BN=128, BK=16, TM=16, TN=8` (128 threads, 8×16 thread tile), **34.0 TFLOPS @ N=4096 — +52% over the hardcoded baseline (22.3 → 34.0)**. We now nearly match Simon's autotuned A100 2D blocktile (65.2% vs 84.8%) and **beat Simon's hardcoded warptile when run on H100** (65.2% vs 60.9%). Three lessons: (a) BK=16 is a sweet spot, not a "deeper is better" ladder; (b) **TM and TN are NOT mirror-symmetric** — `(TM=16, TN=8)` runs 30% faster than the swapped `(TM=8, TN=16)`, because the compiler hoists `regA[i]` and longer TN causes register-allocation pressure; (c) once SM occupancy saturates, bigger blocks just add SMEM bloat without buying parallelism. Gemini Code Assist caught two real bugs in the autotuner's validity check during PR review (SMEM 2× over-count, and missing `NUM_THREADS % BK == 0` divisibility leading to silent OOB SMEM writes for BK=24 candidates — fixed in commit 38f8709). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 5 "Autotune result" for full details.
 
 **Vectorized autotune (2026-05-31)**: Vectorized kernel autotuned across 16 candidates using same structure as 2D blocktile (non-transposed As, strided scalar loads) plus float4 (128-bit) C stores. Same winner as 2D: `(BM=BN=128, BK=16, TM=16, TN=8)` at **34.7 TFLOPS @ N=4096 — +1.1T (+3.3%) over 2D blocktile autotune**. The float4 store alone adds measurable gain on H100 by reducing L1 cache-sector transactions during the C writeback phase. Total FP32 progress: naive 10.2% → 66.9% of cuBLAS FP32 (+56.7pp). See [`autotune.md`](autotune.md) Step 6 autotune section for details.
 
@@ -50,13 +49,13 @@ Shared infra: [`matmul.cpp`](matmul.cpp) (benchmark harness), [`matmul_kernel.h`
 
 ### Why We Diverge at 2D Blocktile
 
-Our kernels use **hardcoded tile dimensions** (`BM=128, BN=128, BK=8`, `WM=64, WN=64`). These values were chosen for A100. On H100 (more SMs, bigger SMEM), different tile sizes are optimal. Simon's autotuning sweeps BM/BN/BK per kernel and per GPU — that's how he gets warptile to 93.7%.
+Our kernels use **hardcoded tile dimensions** (`BM=128, BN=128, BK=8`, `WM=64, WN=64`). These values were chosen for A100. On H100 (more SMs, bigger SMEM), different tile sizes are optimal. Simon's autotuning sweeps BM/BN/BK for 2D blocktile — that's how he gets 84.8% (vs 68.7% hardcoded). His warptile (93.7%) uses hardcoded tiles and was not separately autotuned. We see the same pattern: our autotuned 2D blocktile is 1.5× faster than hardcoded, and our autotuned warptile is +18% over hardcoded.
 
 **The gap is not algorithmic — it's parameter tuning.** Our vectorized kernel (which is less sensitive to tile sizes) already achieves 63.0% vs cuBLAS FP32 (32.9 TFLOPS absolute, beating Simon's 21.8 T).
 
 ### Head-to-Head on Same Hardware (Both on H100)
 
-Pranjal ran Simon's final (autotuned) warptile kernel on H100 and got **31.8 TFLOPS**.
+Pranjal ran Simon's warptile kernel on H100 and got **31.8 TFLOPS**.
 
 | Kernel | TFLOPS | % vs cuBLAS FP32 | % of FP32 peak (67T) |
 |---|---|---|---|
