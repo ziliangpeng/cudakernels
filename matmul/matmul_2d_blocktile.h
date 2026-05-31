@@ -32,4 +32,36 @@ public:
     ~Matmul2DBlocktile() override;
 };
 
+// 2D Block Tiling with autotuning — sweeps (BM, BN, BK, TM, TN) candidates the
+// first time execute() is called and caches the best for subsequent launches.
+//
+// 11 candidates explored across three axes:
+//   - block tile size (BM, BN): 64..256, including asymmetric pairs
+//   - K depth         (BK):    8 or 16
+//   - thread tile     (TM,TN): 4..16, asymmetric allowed
+//
+// Sweep policy: 2 warmup + 3 timed launches per candidate, median wins.
+// Warmup is followed by cudaGetLastError to skip failing configs cleanly.
+class Matmul2DBlocktileAuto : public MatmulKernel {
+private:
+    int N;
+    int blockDim;
+    int best_BM;
+    int best_BN;
+    int best_BK;
+    int best_TM;
+    int best_TN;
+    float best_time_ms;
+    bool tuned;
+
+    void tune(const float *d_A, const float *d_B, float *d_C);
+    void launch(const float *d_A, const float *d_B, float *d_C,
+                int BM, int BN, int BK, int TM, int TN);
+
+public:
+    Matmul2DBlocktileAuto(int N, int blockDim);
+    void execute(const float *d_A, const float *d_B, float *d_C) override;
+    ~Matmul2DBlocktileAuto() override;
+};
+
 #endif
