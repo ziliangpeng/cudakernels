@@ -400,21 +400,25 @@ This is the **biggest single-step jump** in the entire project so far (+52%). We
 
 | # | BM | BN | BK | TM | TN | thr | SMEM | TFLOPS | notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| 0 | 128 | 128 | 8 | 8 | 8 | 256 | 16K | 22.45 | default |
-| 1 | 64 | 64 | 8 | 8 | 8 | 64 | 8K | 28.18 | |
-| 2 | 128 | 128 | 8 | 16 | 8 | 128 | 16K | 32.84 | runner-up |
-| 3 | 128 | 128 | 8 | 8 | 16 | 128 | 16K | 22.91 | TM↔TN mirror at BK=8 |
-| 4 | 128 | 128 | 16 | 8 | 8 | 256 | 32K | 28.89 | |
-| 5 | 128 | 64 | 8 | 8 | 8 | 128 | 12K | 25.47 | asymmetric (tall) |
-| 6 | 64 | 128 | 8 | 8 | 8 | 128 | 12K | 28.30 | asymmetric (wide) |
-| 7 | 128 | 128 | 8 | 4 | 4 | 1024 | 16K | 21.61 | small thread tile |
-| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 24K | 29.20 | |
-| 9 | 128 | 256 | 8 | 8 | 16 | 256 | 24K | 21.45 | mirror of #8 |
-| **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **32K** | **34.04** | **winner** |
-| 11 | 256 | 128 | 16 | 16 | 8 | 256 | 48K | 31.81 | expansion (worse) |
-| 12 | 128 | 128 | 32 | 16 | 8 | 128 | 64K | 22.17 | expansion (SMEM wall) |
-| 13 | 128 | 128 | 16 | 8 | 16 | 128 | 32K | 23.96 | expansion (TM↔TN at BK=16) |
+| 0 | 128 | 128 | 8 | 8 | 8 | 256 | 8K | 22.45 | default |
+| 1 | 64 | 64 | 8 | 8 | 8 | 64 | 4K | 28.18 | |
+| 2 | 128 | 128 | 8 | 16 | 8 | 128 | 8K | 32.84 | runner-up |
+| 3 | 128 | 128 | 8 | 8 | 16 | 128 | 8K | 22.91 | TM↔TN mirror at BK=8 |
+| 4 | 128 | 128 | 16 | 8 | 8 | 256 | 16K | 28.89 | |
+| 5 | 128 | 64 | 8 | 8 | 8 | 128 | 6K | 25.47 | asymmetric (tall) |
+| 6 | 64 | 128 | 8 | 8 | 8 | 128 | 6K | 28.30 | asymmetric (wide) |
+| 7 | 128 | 128 | 8 | 4 | 4 | 1024 | 8K | 21.61 | small thread tile |
+| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12K | 29.20 | |
+| 9 | 128 | 256 | 8 | 8 | 16 | 256 | 12K | 21.45 | mirror of #8 |
+| **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16K** | **34.08** | **winner** |
+| 11 | 256 | 128 | 16 | 16 | 8 | 256 | 24KB | 31.81 | expansion (worse) |
+| 12 | 128 | 128 | 32 | 16 | 8 | 128 | 32KB | 22.17 | expansion (SMEM wall) |
+| 13 | 128 | 128 | 16 | 8 | 16 | 128 | 16KB | 23.96 | expansion (TM↔TN at BK=16) |
 | 14 | 256 | 256 | 16 | 16 | 8 | 512 | — | SKIPPED | register spill |
+| 15 | 256 | 128 | 24 | 16 | 8 | 256 | 36KB | 25.16 | v3 — BK=24 doesn't help at bigger block |
+| 16 | 256 | 128 | 32 | 16 | 8 | 256 | 48KB | 20.92 | v3 — BK=32 confirmed bad at all blocks |
+| 17 | 128 | 128 | 24 | 16 | 8 | 128 | 24KB | 27.69 | v3 — BK=24 also worse than BK=16 |
+| 18 | 256 | 256 | 8 | 16 | 8 | 512 | — | SKIPPED | v3 — register spill (256² area) |
 
 ### Reproducibility check
 
@@ -431,7 +435,7 @@ Winner-vs-runner-up gap (+3.6%) dwarfs noise floor (0.2%). The bug-suspicion we 
 ### Lessons (vs Lesson 2 surprises especially)
 
 #### Lesson 1: BK = 16 is a sweet spot, not a monotonic ladder
-BK=8 → 32.8T; BK=16 → 34.0T; BK=32 → 22.2T. Going past 16 forces SMEM occupancy to drop from 7 blocks/SM to 3 blocks/SM — latency hiding collapses. **K-loop depth has a sweet spot, not a "deeper is better" curve.**
+BK=8 → 32.8T; BK=16 → 34.0T; BK=24 → 27.7T; BK=32 → 22.2T. Going past 16 raises SMEM per block, which drops the number of resident blocks per SM and collapses latency hiding. **K-loop depth has a sweet spot, not a "deeper is better" curve.** (Note: an earlier version of this doc reported SMEM 2× too high because the autotuner formula included a redundant factor of 2 from a double-buffered design we never actually built. Real SMEM = `(BM*BK + BK*BN) * 4` bytes. Conclusion stands; numbers corrected in commit 8c304be.)
 
 #### Lesson 2: TM and TN are NOT mirror-symmetric (most surprising)
 `(TM=16, TN=8) → 34.04 TFLOPS` but `(TM=8, TN=16) → 23.96 TFLOPS`. Same total reuse (TM·TN=128), same SMEM, same thread count. Difference: the inner loop is `for i { for j { ... regA[i] * regB[j] } }`. Hoisted `regA[i]` has lifetime TN cycles. Long TN forces all regB[0..TN-1] to be live simultaneously → tighter register allocation → likely partial spill of accumulators.

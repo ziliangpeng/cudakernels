@@ -528,7 +528,7 @@ BK=16  → 34.04 TFLOPS  (candidate 10) ← peak
 BK=32  → 22.17 TFLOPS  (candidate 12) ← collapse
 ```
 
-Going from BK=16 to BK=32 doubled SMEM per block (64KB), forcing the SM to hold only ⌊228KB / 64KB⌋ = 3 resident blocks instead of 7. **Occupancy collapsed, throughput dropped 35%.** The K-loop chunk size has to balance "more compute per sync" against "fewer blocks fit per SM" — BK=16 hits that balance on H100.
+Going from BK=16 to BK=32 doubled SMEM per block (32KB vs 16KB), forcing the SM occupancy to drop substantially. **Occupancy collapsed, throughput dropped 35%.** The K-loop chunk size has to balance "more compute per sync" against "fewer blocks fit per SM" — BK=16 hits that balance on H100. (Note: an earlier version of this doc miscounted SMEM 2× because the validity check used a `2 * (BM*BK + BK*BN)` formula reflecting a double-buffered pipeline we never actually implemented. Real SMEM is single-buffered: `(BM*BK + BK*BN) * 4` bytes. The qualitative finding stands — BK=32 still doubles SMEM relative to BK=16 — but the absolute numbers in the original write-up were inflated 2×. Corrected in commit 8c304be.)
 
 #### Lesson 2: TM and TN are NOT mirror-symmetric
 
