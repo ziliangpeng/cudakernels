@@ -146,6 +146,102 @@ Shared memory is the single biggest jump for memory-bound kernels. 32× reductio
 
 ---
 
-## To be continued...
+---
 
-TODO: 1D blocktile, 2D blocktile, vectorized, warptile — document each step's insight.
+## Step 4: 1D Blocktile — Thread-Level Reuse via Registers
+
+**File**: [`matmul_1d_blocktile.cu`](matmul_1d_blocktile.cu) | **Class**: `Matmul1DBlocktile`
+
+### Core insight: two levels of reuse
+
+SMEM tiling (Step 3) solved **block-level reuse**: 1024 threads cooperatively load a tile from HBM into shared memory once, then everyone reads from on-chip SRAM instead of HBM. This exploits the L1/SMEM SRAM as a bandwidth amplifier.
+
+**But** inside each thread, the k-loop still Read → Use Once → Discard:
+
+```c
+// SMEM kernel: thread (ty=3, tx=5) — one output, bandwidth-inefficient within thread
+for (int k = 0; k < 32; k++)
+    sum += As[3][k] * Bs[k][5];  // read Bs[k][5] from SMEM, use once, throw away
+```
+
+Every SMEM read produces exactly **1 madd**. SMEM bandwidth is ~19 TB/s per SM — fast, but only half-utilized when reads are 1:1 with computation.
+
+1D Blocktile adds **thread-level reuse via registers**: each thread computes 8 output elements along a column, and reuses each `B` value from SMEM across all 8 partial sums stored in registers.
+
+### Memory hierarchy: where each level's reuse happens
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  HBM (80GB, 3.35 TB/s)                                        │
+│  Naive/Coalesced: each thread reads from here, N times        │
+│  No reuse — everyone independently reloads the same data      │
+└────────────────────┬─────────────────────────────────────────┘
+                     │ SMEM tiling: cooperative tile load
+                     │ 32× fewer HBM trips per thread
+                     ▼
+┌──────────────────────────────────────────────────────────────┐
+│  SMEM / L1 (256KB per SM, ~19 TB/s)                           │
+│  SMEM tiling: block-level reuse                               │
+│    → Read A/B tile into shared memory once                    │
+│    → All threads in block share the tile                      │
+│  ⚠️ But each thread: read → use once → discard → read again   │
+│    → 1 SMEM read = 1 madd (arithmetic intensity too low)      │
+└────────────────────┬─────────────────────────────────────────┘
+                     │ 1D Blocktile: store B value in register
+                     │ Reuse it across 8 output elements
+                     ▼
+┌──────────────────────────────────────────────────────────────┐
+│  Register File (256KB per SM, ~0 cycle latency)               │
+│  1D Blocktile: thread-level reuse                             │
+│    → Load Bs[dotIdx][threadCol] into register (tmpB)          │
+│    → Multiply against 8 different A rows stored in registers  │
+│    → 1 SMEM read = 8 madds (8× arithmetic intensity)          │
+│    → Equivalent SMEM bandwidth amplified 8×                   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+| Level | What is reused | Who reuses it | Mechanism |
+|---|---|---|---|
+| SMEM / L1 | A and B tiles | All threads in the block | `__shared__` scratchpad |
+| Register File | B element (`tmpB`) | A single thread, across 8 partial sums | Local variable held in register |
+
+### What the code does
+
+```
+BM=64, BN=64, BK=8, TM=8
+512 threads per block (64×64/8 = 512 instead of 1024)
+
+Each thread:
+  threadCol (0-63): which column in the output block
+  threadRow (0-7):  which group of 8 rows (threadRow * 8 through threadRow * 8 + 7)
+
+  threadResults[TM] = {0, 0, 0, 0, 0, 0, 0, 0};  // 8 partial sums in registers
+```
+
+```c
+// Key inner loop — tmpB reused 8 times inside each dotIdx iteration
+for (int dotIdx = 0; dotIdx < BK_1D; dotIdx++) {      // BK=8
+    float tmpB = Bs[dotIdx][threadCol];                // ← 1 SMEM read
+    for (int resIdx = 0; resIdx < TM_1D; resIdx++) {   // TM=8
+        threadResults[resIdx] +=                       // ← 8 register accumulators
+            As[threadRow * TM + resIdx][dotIdx] * tmpB; //   all reuse the same tmpB
+    }
+}
+```
+
+The critical line is `As[threadRow * TM + resIdx][dotIdx]` — as `resIdx` varies from 0 to 7, we stride across 8 consecutive rows of `As`, each contributing one `A` value per iteration. `tmpB` stays in a register across all 8 madd operations.
+
+### Performance
+
+| Kernel | TFLOPS | % vs cuBLAS FP32 | Improvement |
+|---|---|---|---|
+| SMEM tiling | 9.0 T | 17.2% | — |
+| **1D blocktile** | **17.6 T** | **33.7%** | **+96%** |
+
+### What we learned
+
+> **SMEM tiling reuses data at the L1/SMEM level (block-level reuse). 1D blocktile adds reuse at the register level (thread-level reuse).**
+
+The 96% jump (from 5.7T to 9.0T was block-level SMEM; from 9.0T to 17.6T was register-level thread reuse) comes from making each SMEM read do 8× more work. The same B element is read once from SMEM, held in a register, and multiplied against 8 different A values — each producing a different partial sum. This amplifies the effective SMEM bandwidth by 8× without changing the tile loading pattern at all.
+
+The memory hierarchy insight: HBM → SMEM/L1 fixed the *cross-thread* waste; Register reuse fixed the *within-thread* waste. Both layers are needed to approach the hardware limit.
