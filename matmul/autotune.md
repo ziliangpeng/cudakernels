@@ -283,3 +283,97 @@ These insights don't come from reading more theory. They come from **running the
 - [`worklog.md`](worklog.md) — per-step optimization narrative
 - [`blog-comparison-2026-05-30.md`](blog-comparison-2026-05-30.md) — gap analysis vs Simon (A100 autotuned) and Pranjal (H100 TC)
 - [`../docs/ncu-profiling-2026-05-30.md`](../docs/ncu-profiling-2026-05-30.md) — Nsight profiling baseline
+
+---
+
+## Actual Results — 1D Blocktile (2026-05-30)
+
+First autotune step executed. Branch: `autotune-1d-blocktile`. Class: `Matmul1DBlocktileAuto`.
+
+### Lessons from running the sweep
+
+Several of the predictions from the design section above turned out wrong or only partially right. Recording the corrections is the whole point of an autotune log.
+
+#### Lesson 1: The kernel's load pattern constrained the search space far more than expected
+
+Original prediction (autotune.md §"Step 4 — 1D blocktile"): "BM, BN, BK, TM can vary independently; sweep ~50 candidates."
+
+Reality: The hand-written kernel uses 1-element-per-thread load:
+```c
+innerRowA = tid / BK;   // covers BM × BK
+innerRowB = tid / BN;   // covers BK × BN
+```
+Combined with `NUM_THREADS = (BM*BN)/TM`, this forces:
+```
+BM = BN  AND  BM = BK · TM
+```
+This eliminates almost all asymmetric configs. The "13-candidate 4K-friendly grid" we initially designed had **only 2 legal entries** when this constraint was applied. The first sweep crashed with `illegal memory access` because we didn't validate it before launching. The fix was a 7-candidate restricted grid.
+
+**Generalization**: The strided load pattern in 2D blocktile (and CUTLASS) decouples NUM_THREADS from tile dimensions, which is why those kernels enjoy a much larger autotune space. For future kernel steps, we'll write strided loads from the start specifically to enable autotuning.
+
+#### Lesson 2: H100 prefers smaller BK and larger TM, not "bigger tile"
+
+Original prediction: "Larger BM × BN reduces block count → reduces tile-loading redundancy."
+
+Reality: The winning config was the **smaller-BK, larger-TM** version, not a larger tile.
+
+| Knob | Default `(64,8,8)` | Best `(64,4,16)` | Direction |
+|---|---|---|---|
+| BK | 8 | 4 | smaller |
+| TM | 8 | 16 | larger |
+| Threads/block | 512 | 256 | fewer |
+| SMEM/block | 4KB | 2KB | smaller |
+| Register reuse per SMEM read | 8× | **16×** | larger |
+
+This rewards exactly what 1D blocktile's algorithm is about: **register reuse**. More outputs per thread (TM ↑) = more madds per SMEM B load. Smaller SMEM footprint lets more blocks fit per SM, keeping occupancy high.
+
+#### Lesson 3: Bad configs validate the algorithm's mechanism
+
+Candidate 3 (`BM=64, BK=16, TM=4`) was the **worst** at 12.13 TFLOPS despite using 1024 threads/block (theoretically max occupancy). With TM=4, each thread only computes 4 outputs, so the register reuse factor drops to 4× — barely above scalar SMEM kernel. Throughput dropped 30% below the default.
+
+This is a direct empirical confirmation of the mental model from `worklog.md` Step 4: **register reuse is what drives 1D blocktile, not occupancy or thread count.**
+
+#### Lesson 4: Autotune surfaces algorithm ceilings, not raises them
+
+Best 1D blocktile config: 19.26 TFLOPS (36.9% vs cuBLAS FP32).
+2D blocktile hardcoded: 22.4 TFLOPS (42.9%).
+
+Even tuned to the limit, 1D cannot beat 2D — because 2D adds register reuse on A (via outer product) that 1D fundamentally lacks. **Autotune optimizes within an algorithm's ceiling; only a new algorithm raises the ceiling.**
+
+### Performance summary
+
+| Variant | Config | N=4096 TFLOPS | vs cuBLAS FP32 |
+|---|---|---|---|
+| `1d_blocktile` (hardcoded baseline) | `(64, 64, 8, 8)` | 17.6 | 33.7% |
+| **`1d_blocktile_auto` (winning config)** | **`(64, 64, 4, 16)`** | **19.3** | **36.9%** |
+| Delta | — | **+9.2%** | **+3.2pp** |
+| Simon's autotuned 1D (A100) | (varies) | 8.5 | 36.5% |
+
+We now slightly edge Simon's A100 autotuned percentage at this step (36.9% vs 36.5%) — the first time our autotuned number matches a fully autotuned A100 baseline.
+
+### Implementation notes
+
+- Sweep runs **on first call to `execute()`**, not in constructor. Constructors should not do GPU work.
+- The first timed iteration in the benchmark harness is slightly slower (it includes the sweep), but the harness already takes a median over 100 iterations, so the sweep cost is invisible in the reported number.
+- Sweep policy: 2 warmup + 3 timed iterations per candidate, median wins.
+- Total sweep cost at N=4096: ~6 candidates × 5 launches × ~7ms ≈ 200ms. Negligible against a 100-iteration timing loop that runs ~700ms.
+- No CSV output written yet — `printf` only. Add CSV when we have more steps to compare.
+- No `nvcc --ptxas-options=-v` register check yet — added as a TODO for next step (2D blocktile autotune).
+
+### Open questions for next steps
+
+1. **Should we rewrite 1D blocktile with strided loads to enable asymmetric tiles?** The autotune space would grow ~10×, possibly finding a 20-22 TFLOPS config. But this duplicates 2D blocktile's load pattern without giving us the 2D register reuse — limited educational return.
+2. **Should `1d_blocktile_auto` print best config in the benchmark summary table?** Currently only shows up in stdout during sweep. The benchmark table just shows TFLOPS like any other method. Adding a "config" column would be nice but requires harness changes.
+3. **Should autotune timing use the same 100-iter median as the main benchmark?** Currently uses 3-iter median (faster). Risk: noisy candidates might rank wrong. Mitigated by 9% gap between best and second-best — well above noise floor.
+
+---
+
+## Status
+
+| Step | Autotune status | Best TFLOPS @ N=4096 | Winning config |
+|---|---|---|---|
+| SMEM | TODO | 9.0 (hardcoded) | — |
+| **1D blocktile** | **✅ Done** | **19.3** | **`(BM=BN=64, BK=4, TM=16)`** |
+| 2D blocktile | TODO | 22.4 (hardcoded) | — |
+| Vectorized | TODO | 32.9 (hardcoded) | — |
+| Warptile | TODO | 28.3 (hardcoded) | — |
