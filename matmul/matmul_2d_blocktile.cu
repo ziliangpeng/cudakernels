@@ -20,7 +20,9 @@
 // All boundary checks preserved for arbitrary N.
 
 template<int BM, int BN, int BK, int TM, int TN>
-__global__ void matmul2DBlocktileKernelT(const float *A, const float *B, float *C, int N) {
+__global__ void matmul2DBlocktileKernelT(const float * __restrict__ A,
+                                          const float * __restrict__ B,
+                                          float *C, int N) {
     __shared__ float As[BM][BK];
     __shared__ float Bs[BK][BN];
 
