@@ -370,18 +370,19 @@ void MatmulWarptileAuto::tune(const float *d_A, const float *d_B, float *d_C) {
         int BM = c.BM, BN = c.BN, BK = c.BK, TM = c.TM, TN = c.TN, WM = c.WM, WN = c.WN;
 
         // Validity checks
+        if (BM == 0 || BN == 0 || BK == 0 || TM == 0 || TN == 0 || WM == 0 || WN == 0) continue;
+        if (BN % WN != 0 || BM % WM != 0) continue;
         int warps_x = BN / WN;
         int warps_y = BM / WM;
         int num_warps = warps_x * warps_y;
         int threads_per_block = num_warps * 32;
-        if (threads_per_block > 1024) continue;
-        if (BN % WN != 0 || BM % WM != 0) continue;
+        if (threads_per_block <= 0 || threads_per_block > 1024) continue;
         if (WM % TM != 0 || WN % TN != 0) continue;
         // Subtiles must be integer
+        if (WM % (4 * TM) != 0 || WN % (8 * TN) != 0) continue;
         int stm = WM / (4 * TM);
         int stn = WN / (8 * TN);
         if (stm < 1 || stn < 1) continue;
-        if (WM % (4 * TM) != 0 || WN % (8 * TN) != 0) continue;
         // SMEM — As is padded to BM+1 (bank-conflict avoidance)
         int smem_bytes = (BK * (BM + 1) + BK * BN) * sizeof(float);
         if (smem_bytes > 48 * 1024) continue;
