@@ -490,7 +490,7 @@ Implemented `Matmul2DBlocktileAuto` (see `matmul_2d_blocktile.cu`). 15-candidate
 
 | # | BM | BN | BK | TM | TN | Threads | SMEM | TFLOPS |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **32KB** | **34.04** |
+| **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16KB** | **33.73** |
 | 2 | 128 | 128 | 8 | 16 | 8 | 128 | 16KB | 32.84 |
 | 11 | 256 | 128 | 16 | 16 | 8 | 256 | 48KB | 31.77 |
 | 8 | 256 | 128 | 8 | 16 | 8 | 256 | 24KB | 29.23 |
@@ -513,29 +513,31 @@ Implemented `Matmul2DBlocktileAuto` (see `matmul_2d_blocktile.cu`). 15-candidate
 | Outputs per thread | 64 | 128 | 2× |
 | Register accumulators / thread | 64 | 128 | 2× |
 | K-loop iterations (N=4096) | 512 | 256 | ½× |
-| Median time | 6.13 ms | 4.04 ms | −34% |
-| **TFLOPS** | **22.45** | **34.04** | **+51.6%** |
+| Median time | 6.18 ms | 4.07 ms | −34% |
+| **TFLOPS** | **22.24** | **33.73** | **+51.7%** |
 
-The +52% jump pushes 2D blocktile from 42.9% to **65.1%** of cuBLAS FP32, basically closing the gap to Simon's autotuned A100 (68.7%) and substantially beating Simon's autotuned warptile running on H100 (60.9%).
+The +52% jump pushes 2D blocktile from 42.9% to **64.6%** of cuBLAS FP32, closing most of the gap to Simon's autotuned A100 (68.7%) and beating Simon's autotuned warptile running on H100 (60.9%).
 
 ### Four lessons from the sweep
 
 #### Lesson 1: BK = 16 is a sweet spot, not a monotonic ladder
 
 ```
-BK=8   → 32.84 TFLOPS  (candidate 2)
-BK=16  → 34.04 TFLOPS  (candidate 10) ← peak
-BK=32  → 22.17 TFLOPS  (candidate 12) ← collapse
+BK=8   → 32.40 TFLOPS  (candidate 2)
+BK=16  → 33.73 TFLOPS  (candidate 10) ← peak
+BK=32  → 22.47 TFLOPS  (candidate 12) ← collapse
 ```
 
-Going from BK=16 to BK=32 doubled SMEM per block (32KB vs 16KB), forcing the SM occupancy to drop substantially. **Occupancy collapsed, throughput dropped 35%.** The K-loop chunk size has to balance "more compute per sync" against "fewer blocks fit per SM" — BK=16 hits that balance on H100. (Note: an earlier version of this doc miscounted SMEM 2× because the validity check used a `2 * (BM*BK + BK*BN)` formula reflecting a double-buffered pipeline we never actually implemented. Real SMEM is single-buffered: `(BM*BK + BK*BN) * 4` bytes. The qualitative finding stands — BK=32 still doubles SMEM relative to BK=16 — but the absolute numbers in the original write-up were inflated 2×. Corrected in commit 8c304be.)
+Going from BK=16 to BK=32 doubled SMEM per block (32KB vs 16KB) and pushed the SM toward fewer resident blocks. **Throughput dropped 33%.** The K-loop chunk size has to balance "more compute per sync" against "fewer blocks fit per SM" — BK=16 hits that balance on H100.
+
+Earlier drafts of this doc cited a BK=24 datapoint at 27.7T. That number was **invalid** — the kernel's strided load requires `NUM_THREADS % BK == 0`, which BK=24 violates (`128 % 24 = 8`, `256 % 24 = 16`). The autotuner's validity check missed this, so candidates 15 and 17 were silently writing OOB into SMEM during the previous run. Gemini Code Assist caught this in PR review (commit 38f8709 added the missing divisibility checks); after the fix those candidates are correctly filtered out before launch. The valid data we have is BK ∈ {8, 16, 32}; the sweet-spot conclusion stands but we should not extrapolate to claims about BK=24.
 
 #### Lesson 2: TM and TN are NOT mirror-symmetric
 
 The most surprising finding:
 
 ```
-TM=16, TN= 8 → 34.04 TFLOPS  (candidate 10)
+TM=16, TN= 8 → 33.73 TFLOPS  (candidate 10)
 TM= 8, TN=16 → 23.96 TFLOPS  (candidate 13) ← −30% from a mirror swap
 ```
 
@@ -548,8 +550,8 @@ This is one of those autotune findings that **no theory paper would tell you**. 
 #### Lesson 3: Bigger block ≠ better when occupancy already saturates
 
 ```
-BM=128, BN=128  →  34.04 TFLOPS  (candidate 10)
-BM=256, BN=128  →  31.77 TFLOPS  (candidate 11)
+BM=128, BN=128  →  33.73 TFLOPS  (candidate 10)
+BM=256, BN=128  →  31.54 TFLOPS  (candidate 11)
 BM=256, BN=256  →  REGISTER SPILL  (candidate 14)
 ```
 
