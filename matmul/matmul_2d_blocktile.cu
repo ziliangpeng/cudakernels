@@ -165,6 +165,14 @@ static const Candidate2D CANDIDATES_2D[] = {
     {256, 128,  8, 16,  8},   //  [ 8] bigger block (tall) — 128 threads, 24KB SMEM
     {128, 256,  8,  8, 16},   //  [ 9] bigger block (wide) — 128 threads, 24KB SMEM
     {128, 128, 16, 16,  8},   // [10] deepest BK + bigger TM — 128 threads, 32KB SMEM
+    // --- Grid expansion v2 (informed by first sweep) ---
+    // First sweep showed winners cluster around (large TM, deeper BK).
+    // These probes test how far that trend extrapolates before hitting other
+    // resource walls (SMEM port pressure, register count, K-loop overhead).
+    {256, 128, 16, 16,  8},   // [11] push #10 winner to bigger block (tall)
+    {128, 128, 32, 16,  8},   // [12] does BK=32 keep winning, or oversaturate?
+    {128, 128, 16,  8, 16},   // [13] mirror of #10 — TM↔TN swap, same total reuse
+    {256, 256, 16, 16,  8},   // [14] big square block + deepest BK + best TM/TN
 };
 static const int NUM_CANDIDATES_2D = sizeof(CANDIDATES_2D) / sizeof(CANDIDATES_2D[0]);
 
@@ -193,6 +201,10 @@ void Matmul2DBlocktileAuto::launch(const float *d_A, const float *d_B, float *d_
     DISPATCH(256, 128,  8, 16,  8)
     DISPATCH(128, 256,  8,  8, 16)
     DISPATCH(128, 128, 16, 16,  8)
+    DISPATCH(256, 128, 16, 16,  8)
+    DISPATCH(128, 128, 32, 16,  8)
+    DISPATCH(128, 128, 16,  8, 16)
+    DISPATCH(256, 256, 16, 16,  8)
 
     #undef DISPATCH
 
