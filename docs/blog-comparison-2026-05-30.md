@@ -2,36 +2,72 @@
 
 **Date**: 2026-05-30  
 **Sources**:
-- [siboehm: CUDA Matmul Worklog](https://siboehm.com/articles/22/CUDA-MMM) — A100, N=4096, FP32 path, vs cuBLAS FP32
-- [Pranjal: Outperforming cuBLAS on H100](https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog) — H100, N=4096, TC path, vs cuBLAS BF16
-- Our data: [ncu-profiling-2026-05-30.md](ncu-profiling-2026-05-30.md) — H100, N=1024/2048/4096, both paths
+- [siboehm: CUDA Matmul Worklog](https://siboehm.com/articles/22/CUDA-MMM) — A100, N=4096, FP32 path, vs cuBLAS FP32 (23.2 TFLOPS)
+- [Pranjal: Outperforming cuBLAS on H100](https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog) — H100, N=4096, TC path, vs cuBLAS BF16 (716.7 TFLOPS)
+- Our data: [ncu-profiling-2026-05-30.md](ncu-profiling-2026-05-30.md) — H100, N=4096, vs cuBLAS FP32 (52.2 TFLOPS, `CUBLAS_PEDANTIC_MATH`)
 
-> **Caveat**: Matrix sizes differ (our N=1024/2048 vs their N=4096 for step-by-step), and % values use each blog's own cuBLAS baseline. FP32 baseline is FP32 cuBLAS for siboehm, TF32 TC cuBLAS (495T) for us.
+> **Baseline**: Our cuBLAS uses `cublasSetMathMode(CUBLAS_PEDANTIC_MATH)` — disables TF32, pure FP32. On H100 this achieves **52.2 TFLOPS** at N=4096. All our "% vs cuBLAS" are against this pure FP32 baseline, matching siboehm's methodology.
 
-## FP32 Hand-Written Kernel Path
+---
 
-Pranjal took siboehm's final warptile kernel and ran it on H100: **31.8 TFLOPS, 4% of cuBLAS TF32 TC** (717T). This is the only FP32 data point from Pranjal's blog — he skips the intermediate FP32 steps and jumps straight to Tensor Cores.
+## FP32 Hand-Written Kernel Path (N=4096, both sides)
 
-| Step | siboehm (A100, 4K) | Pranjal (H100, 4K) | Ours (H100, 2K) | Notes |
+All percentages are vs each side's own **cuBLAS FP32** baseline. Our block tile dimensions (BM/BN/BK on 2D/warp) are hardcoded, no autotuning. siboehm autotunes.
+
+| Step | siboehm (A100, 4K) | Ours (H100, 4K) | Gap | Verdict |
 |---|---|---|---|---|
-| Naive | 1.3% (309 GFLOPs) | — | — (skipped at 2K) | |
-| Coalesced | 8.5% (1,987 G) | — | ~13% (6.6 TFLOPS) | H100 faster GMEM hides coalescing gap |
-| SMEM tiling | 12.8% (2,980 G) | — | ~18% (9.2 TFLOPS) | H100's bigger SMEM helps early steps |
-| 1D blocktile | 36.5% (8,475 G) | — | ~34% (16.9 TFLOPS) | Nearly identical |
-| 2D blocktile | 68.7% (15,972 G) | — | ~43% (21.6 TFLOPS) | **-25.7pp gap** ⚠️ |
-| Vectorized | 78.4% (18,237 G) | — | ~65% (32.8 TFLOPS) | **-13.4pp gap** |
-| Warptile (Simon final) | 93.7% (21,779 G) | **31.8 TFLOPS** (4% vs cuBLAS TF32) | ~56% (28.4 TFLOPS) | **-37.7pp gap** ⚠️⚠️ |
-| Autotuning | 84.8% (19,721 G) | — | — | |
+| Naive | 1.3% (0.3 T) | — (not run) | — | |
+| Coalesced | 8.5% (2.0 T) | **10.9%** (5.7 T) | +2.4pp | ✅ ahead |
+| SMEM tiling | 12.8% (3.0 T) | **17.2%** (9.0 T) | +4.4pp | ✅ ahead |
+| 1D blocktile | 36.5% (8.5 T) | 33.7% (17.6 T) | −2.8pp | ≈ tie |
+| 2D blocktile | 68.7% (16.0 T) | 42.9% (22.4 T) | −25.8pp | ⚠️ behind |
+| Vectorized | 78.4% (18.2 T) | **63.0%** (32.9 T) | −15.4pp | ⚠️ behind |
+| Warptile (Simon final) | **93.7%** (21.8 T) | 54.2% (28.3 T) | −39.5pp | ⚠️⚠️ behind |
+| Autotuning | 84.8% (19.7 T) | — | — | — |
 
-### Diagnosis
+**cuBLAS FP32 baseline**: siboehm = 23.2 TFLOPS, ours = 52.2 TFLOPS (H100 has 2.25× more FP32 throughput than A100).
 
-Our kernels diverge from siboehm at 2D blocktile. Root causes:
+### Key Observations
 
-1. **Block dim**: ours = 16×16 fixed for all methods. siboehm = 128×8 for warp tiling and tunes it per step. 16×16 gives only 256 threads — not enough warps to hide latency on H100's 132 SMs.
-2. **Matrix size**: N=2048 vs N=4096. At smaller N, tile count / SM is lower, so occupancy drops. H100 has 132 SMs vs A100's 108 — more SMs = even more pressure to have enough tiles.
-3. **No autotuning**: siboehm sweeps BM/BN/BK per kernel. Our fixed 16×16 works for naive but hurts advanced kernels.
+1. **Coalesced + SMEM**: we lead. H100's faster global memory + larger SMEM give a head start at the simple optimization steps. Expected — these steps are hardware-bound, not algorithm-bound.
 
-**Bottom line**: The FP32 optimization path is correct. With proper block dim + autotuning we'd likely match or exceed siboehm's numbers (H100 has faster SM clock + more SMEM per SM).
+2. **1D blocktile**: nearly identical (33.7% vs 36.5%). Both sides are compute-bound at this point and scaling correctly.
+
+3. **2D blocktile**: **the divergence point**. siboehm jumps to 68.7%, we only get to 42.9%. Our 2D kernel uses hardcoded `BM=128, BN=128, BK=8` — these tile sizes are tuned for siboehm's A100 (108 SMs, 164 KB SMEM). On H100 (132 SMs, 228 KB SMEM), different tile sizes are optimal.
+
+4. **Vectorized**: we close some of the gap (63.0% vs 78.4%). float4 loads help regardless of tile size.
+
+5. **Warptile**: **the gap explodes** (54.2% vs 93.7%). Our warptile actually regresses from vectorized (28.3 vs 32.9 TFLOPS!). The hardcoded warp tile parameters (`WM=64, WN=64, TM=8, TN=4`) are almost certainly wrong for H100. siboehm's warptile with autotuned 128×8 block dim → 93.7%. Our warptile with fixed params → 54.2%. **This is entirely an autotuning gap, not an algorithmic one.**
+
+6. **Absolute TFLOPS**: despite the % gap, our vectorized (32.9 T) actually computes more raw FLOPS than siboehm's warptile (21.8 T). H100's raw FP32 throughput is 2.7× of A100's. The % gap means we're leaving performance on the table, not that our code is wrong.
+
+### Root Cause: No Autotuning
+
+Simon's critical insight that we're missing: **optimal tile dimensions (BM, BN, BK) depend on the GPU architecture, and the only way to find them is to sweep.**
+
+```
+Ours: BM=128, BN=128, BK=8   ← hardcoded, same for all kernels
+H100 optimal: unknown without sweep
+A100 optimal (siboehm): BM=128, BN=128, BK=8 for 2D, tuned per kernel
+```
+
+Why this matters so much for warptile specifically: warptile has 4 hierarchical tile sizes (block BM/BN/BK → warp WM/WN → thread TM/TN). Getting any of them wrong cascades — if block tile doesn't fill SMEM well, warps are under-subscribed, and thread tiles waste registers. This is why our warptile regresses instead of improving.
+
+---
+
+## Simon's Final Algorithm: Head-to-Head (N=4096, H100)
+
+Pranjal took siboehm's final (autotuned) warptile kernel and ran it on H100: **31.8 TFLOPS**. Our best FP32 kernel without autotuning:
+
+| Kernel | TFLOPS | % vs cuBLAS FP32 | % of FP32 peak (67T) | vs Simon |
+|---|---|---|---|---|
+| Simon's warptile (on H100) | 31.8 | 60.9% | 47.5% | — |
+| **Our vectorized (float4)** | **32.9** | **63.0%** | **49.1%** | **+3.5%** ✅ |
+| Our warptile | 28.3 | 54.2% | 42.2% | −11.0% |
+
+**We beat Simon on absolute TFLOPS** — 32.9 vs 31.8 — despite lacking autotuning. This is because H100 has 2.7× the raw FP32 throughput of A100. But our **% vs cuBLAS** (63.0%) is far below Simon's A100 number (93.7%) because H100's cuBLAS FP32 is also faster (52.2T vs 23.2T).
+
+With proper autotuning, our warptile should reach >70% vs cuBLAS FP32 on H100 — but the FP32 ceiling (~33-35 TFLOPS) means even at 100% we'd only hit ~52 TFLOPS, which is dwarfed by what Tensor Cores offer.
 
 ---
 
@@ -39,50 +75,44 @@ Our kernels diverge from siboehm at 2D blocktile. Root causes:
 
 | Step | Pranjal (H100, 4K) | Ours (H100, 2K) | Notes |
 |---|---|---|---|
-| Simon's FP32 | 4% (31.8 TFLOPS) | 4.6% (32.9 TFLOPS @ 4K) | We beat Simon on H100 |
-| **Tensor Core (WMMA/WGMMA)** | **44%** (317.6 TFLOPS) | **2.6%** (25.6 TFLOPS) | **12.4× gap** ⚠️⚠️ |
-| Larger tiles | 59% (423 T) | — | |
-| Async loads (TMA) | 70% (498.2 T) | — | |
-| Pushing tile limit | 88% (631.9 T) | — | |
-| Hide store latency | 92% (660.1 T) | — | |
-| Faster barriers | 98% (704.9 T) | — | |
-| Thread Block Clusters | 102% (734.2 T) | — | |
-| Micro-optimizations | 104% (747.3 T) | — | |
-| Async Stores | 106% (758.5 T) | — | |
-| Hilbert Curves | 107% (763.9 T) | — | |
-| cuBLAS baseline | 100% (716.7 T) | 100% (287 T, BF16 at 2K) | |
+| Simon's FP32 | 4.4% (31.8 T vs 717T BF16) | 4.6% (32.9 T vs 717T BF16) | We beat Simon on H100 |
+| **TC (WMMA/WGMMA)** | **44.3%** (317.6 T) | **2.6%** (25.6 T) | **17× gap** ⚠️⚠️ |
+| Larger tiles | 59.0% (423 T) | — | |
+| TMA (async loads) | 69.5% (498 T) | — | |
+| Push tile limit | 88.2% (632 T) | — | |
+| Hide store latency | 92.1% (660 T) | — | |
+| Faster barriers | 98.4% (705 T) | — | |
+| Thread Block Clusters | 102.4% (734 T) | — | |
+| Micro-optimizations | 104.3% (747 T) | — | |
+| Async Stores | 105.8% (759 T) | — | |
+| Hilbert Curves | 106.6% (764 T) | — | |
+| cuBLAS BF16 | 100% (716.7 T) | — | |
 
 ### Diagnosis
 
-**12.4× gap at the first TC step.** This is not about algorithmic quality — it's about API choice:
+Pranjal's first TC step (WGMMA) = 44.3% vs cuBLAS BF16. Our WMMA = 2.6%. This is an **API gap**, not a skill gap:
 
-| | Pranjal's first TC kernel | Our WMMA kernel |
+| | Pranjal K1: "Tensor Core" | Our WMMA |
 |---|---|---|
-| API | **WGMMA** (warp-group, 128 threads) | WMMA (single warp, 32 threads) |
-| SM sub-partitions used | 4/4 | 1/4 |
-| Tile size | 64×M (Hopper-native) | 16×16×16 (Volta-era) |
-| Block dim | Optimized for TC occupancy | Hardcoded 16×16 |
-| Memory | Shared memory for tile cache | Direct global memory reads |
-| Nsight profile | Not available | Memory 93%, Compute 17% — Tensor Core starving |
+| API | WGMMA (warp-group, 128 threads) | `nvcuda::wmma` (1 warp, 32 threads) |
+| SM sub-partitions | 4/4 in use | 1/4 in use |
+| Tile | 64×M (Hopper-native) | 16×16 (Volta-era) |
+| Nsight | Not published | Memory 93%, Compute 17% — TC starving |
 
-Pranjal's first TC kernel is already Hopper-optimized (WGMMA). Ours is using Volta's `nvcuda::wmma` API on H100 hardware — only 1 warp out of 4 gets used per SM sub-partition. The nsight data confirms this: Memory 93% means Tensor Cores are idle, waiting for data that a single warp can't supply fast enough.
+Switching from WMMA to WGMMA is expected to take us from 2.6% → ~40-45% in one change. Every step after that (TMA, pipelining, clusters) builds on WGMMA.
 
 ---
 
-## Simon's Final Algorithm: Head-to-Head (N=4096, H100)
+## Summary
 
-Pranjal reports that Simon's final warptile kernel achieves **31.8 TFLOPS** when run on H100. We benchmarked our best FP32 kernels at the same N=4096:
+| Path | Status | Blocked by |
+|---|---|---|
+| FP32 (naive→vectorized) | ✅ done, beats Simon (32.9T > 31.8T) | — |
+| FP32 (warptile) | ⚠️ 54.2% vs cuBLAS, regresses | **No autotuning** (hardcoded BM/BN/BK) |
+| TC (WMMA) | ⚠️ 2.6% vs cuBLAS BF16 | **Wrong API** (WMMA, need WGMMA) |
+| TC (Pranjal K1-K10) | Not started | Need WGMMA first |
 
-| Kernel | TFLOPS | MFU (FP32 67T peak) | vs Simon |
-|---|---|---|---|
-| Simon's warptile (on H100) | 31.8 | 47.5% | — |
-| **Our vectorized (float4)** | **32.9** | **49.1%** | **+3.5%** ✅ |
-| Our warptile | 28.4 | 42.4% | -10.7% |
-| cuBLAS TF32 | 52.3 | 10.6% (TF32 495T) | — |
-
-**We have a kernel that beats Simon's final algorithm** — 32.9 vs 31.8 TFLOPS. The FP32 optimization path (naive → coalesced → smem → 1D/2D blocktile → vectorized) is complete and correct.
-
-However, the FP32 ceiling is ~33 TFLOPS on H100 — that's only **4.6%** of what cuBLAS achieves with Tensor Cores (717T BF16). The FP32 path is a dead end for further gains. The only path forward is the Tensor Core path (WGMMA → TMA → pipelining).
+**The FP32 path shows that autotuning matters massively** — Simon's warptile goes from 78% to 94% by sweeping tile sizes. Our warptile regresses because our hardcoded tiles are wrong for H100. But with the FP32 ceiling at ~33T, the bigger ROI is WGMMA, which opens a path to 700+ TFLOPS.
 
 ---
 
@@ -90,7 +120,7 @@ However, the FP32 ceiling is ~33 TFLOPS on H100 — that's only **4.6%** of what
 
 | Priority | What | Expected Gain |
 |---|---|---|
-| **P0** | Switch to WGMMA (warp-group MMA) — Pranjal's first TC step | 2.6% → ~44% MFU (12×+) |
-| P1 | Fix block dim: 16×16 → dynamic (sweep or autotune) for FP32 kernels | — (already past Simon) |
-| P2 | Add TMA (async copy) — Pranjal step 5 | 44% → 70% |
-| P2 | Profile Nsight at each step of the WGMMA path | |
+| **P0** | Switch to WGMMA — Pranjal's first TC step | 2.6% → ~44% (17×) |
+| P1 | Add autotuning (sweep BM/BN/BK) for FP32 warptile | 28.3T → ~35T (+24%) |
+| P2 | TMA (async copy) — Pranjal step 3 | 44% → 70% |
+| P2 | Profile Nsight at each WGMMA step | |
