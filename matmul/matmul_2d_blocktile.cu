@@ -141,9 +141,10 @@ Matmul2DBlocktile::~Matmul2DBlocktile() {}
 //
 // 11-candidate sweep across (BM, BN, BK, TM, TN). Each candidate satisfies:
 //   - NUM_THREADS = (BM/TM) * (BN/TN) <= 1024 (CUDA hard limit)
-//   - NUM_THREADS divides BM*BK (A tile load)
-//   - NUM_THREADS divides BK*BN (B tile load)
-//   - (BM*BK + BK*BN) * 4 bytes <= 228KB SMEM (H100; single-buffered)
+//   - NUM_THREADS divides BM*BK (A tile load element count)
+//   - NUM_THREADS divides BK*BN (B tile load element count)
+//   - NUM_THREADS divides BK and BN cleanly (so strideA = NUM_THREADS/BK divides BM)
+//   - (BM*BK + BK*BN) * 4 bytes <= 48KB SMEM (default static SMEM limit, no opt-in)
 //   - TM*TN + TM + TN <= ~96 (rough register budget)
 //
 // The sweep itself catches any post-warmup CUDA errors and skips those configs.
@@ -240,13 +241,21 @@ void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
         // Validity (mirrors kernel constexpr requirements):
         if (threads_per_block > 1024) continue;            // CUDA hard limit
         if (BM % TM != 0 || BN % TN != 0) continue;        // thread tile divides block tile
-        if ((BM * BK) % threads_per_block != 0) continue;  // strided A load divides cleanly
-        if ((BK * BN) % threads_per_block != 0) continue;  // strided B load divides cleanly
-        // SMEM check: (BM*BK + BK*BN) * sizeof(float) <= 228KB
-        // Kernel is single-buffered (As and Bs are reused each K-loop iteration
-        // with __syncthreads as the barrier), so no factor of 2.
+        if ((BM * BK) % threads_per_block != 0) continue;  // strided A load divides cleanly (BM)
+        if ((BK * BN) % threads_per_block != 0) continue;  // strided B load divides cleanly (BK)
+        // Stride-itself divisibility: strideA = NUM_THREADS/BK must divide BM, which
+        // requires NUM_THREADS % BK == 0 (so integer-truncation of strideA doesn't
+        // produce a stride that leaves uncovered rows / OOB writes into SMEM).
+        // Same for strideB / BN.
+        if (threads_per_block % BK != 0) continue;
+        if (threads_per_block % BN != 0) continue;
+        // SMEM check: (BM*BK + BK*BN) * sizeof(float) <= 48KB
+        // Default static shared memory limit on CUDA is 48KB per block. H100 allows
+        // up to 228KB per block via cudaFuncSetAttribute(cudaFuncAttributeMaxDynamicSharedMemorySize),
+        // but this kernel uses static __shared__ allocations and never opts in, so
+        // 48KB is the hard limit.
         int smem_bytes = (BM * BK + BK * BN) * sizeof(float);
-        if (smem_bytes > 228 * 1024) continue;
+        if (smem_bytes > 48 * 1024) continue;
         // Boundary fairness: skip non-divisible N (autotune timing is biased by
         // partial-tile branches; benchmark sizes are powers of 2 anyway).
         if (N % BM != 0 || N % BN != 0) continue;
