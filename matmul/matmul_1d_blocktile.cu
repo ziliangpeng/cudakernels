@@ -206,6 +206,18 @@ void Matmul1DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
         }
         cudaDeviceSynchronize();
 
+        // Check for launch failures (register spill, SMEM overrun, illegal access).
+        // CUDA errors are sticky and asynchronous — without this check, a failed warmup
+        // would leave the cudaEvent timers with stale near-zero values, causing the
+        // autotuner to falsely rank a broken config as "best". Calling cudaGetLastError
+        // also clears the sticky state so subsequent candidates evaluate cleanly.
+        cudaError_t warmup_err = cudaGetLastError();
+        if (warmup_err != cudaSuccess) {
+            printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d  thr=%4d  ->  SKIPPED (%s)\n",
+                   i, BM, BN, BK, TM, threads_per_block, cudaGetErrorString(warmup_err));
+            continue;
+        }
+
         float times[3];
         for (int t = 0; t < 3; t++) {
             cudaEventRecord(start);
