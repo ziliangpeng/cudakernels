@@ -1,208 +1,478 @@
 #include "matmul_warptile.h"
 #include "cuda_utils.h"
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <stdexcept>
 
-// Warp Tiling kernel (Kernel 10)
-// Adds warp-level tiling between block and thread levels
-// Three-level hierarchy: Block -> Warp -> Thread
+// ============================================================================
+// Hardcoded Warp Tiling kernel (Kernel 10) — kept as baseline
+// ============================================================================
 
 #define BM_WARP 128
 #define BN_WARP 128
 #define BK_WARP 16
-#define WM 64       // Warp tile M dimension
-#define WN 64       // Warp tile N dimension
-#define TM_WARP 8   // Thread tile M dimension
-#define TN_WARP 4   // Thread tile N dimension
+#define WM 64
+#define WN 64
+#define TM_WARP 8
+#define TN_WARP 4
 #define WARP_SIZE 32
 
-// Warps per block: (BM/WM) * (BN/WN) = 2 * 2 = 4
-#define WARPS_PER_BLOCK_X (BN_WARP / WN)  // 2
-#define WARPS_PER_BLOCK_Y (BM_WARP / WM)  // 2
-#define NUM_WARPS (WARPS_PER_BLOCK_X * WARPS_PER_BLOCK_Y)  // 4
+#define WARPS_PER_BLOCK_X (BN_WARP / WN)
+#define WARPS_PER_BLOCK_Y (BM_WARP / WM)
+#define NUM_WARPS (WARPS_PER_BLOCK_X * WARPS_PER_BLOCK_Y)
 
-// Threads per warp tile: (WM/TM) * (WN/TN) = 8 * 16 = 128
-// But we only have 32 threads per warp, so each thread computes multiple tiles
-// Threads per warp compute: (WM*WN) / (TM*TN*32) = 4096 / 1024 = 4 tiles each? No...
-// Let's recalculate:
-// - Warp produces WM x WN = 64 x 64 = 4096 elements
-// - Each thread produces TM x TN = 8 x 4 = 32 elements
-// - So we need 4096/32 = 128 threads, but warp has only 32
-// - So each thread computes (128/32) = 4 sets of TM x TN
+#define WARP_THREAD_M 4
+#define WARP_THREAD_N 8
+#define WARP_SUBTILE_M 2
+#define WARP_SUBTILE_N 2
 
-#define WARP_ITER_M (WM / (TM_WARP * (WARP_SIZE / (WN / TN_WARP))))  // iterations in M
-#define WARP_ITER_N (WN / TN_WARP / (WARP_SIZE / (WN / TN_WARP)))   // No extra iter in N
-
-// Simpler approach: each thread in warp handles multiple TM x TN tiles
-// Warp layout: 8 threads in N direction (handling 8 * TN = 32 cols)
-//              4 threads in M direction (handling 4 * TM = 32 rows)
-// But we need 64x64, so each thread does 2x2 = 4 tiles in M direction
-#define WARP_THREAD_M 4   // Threads in M direction per warp
-#define WARP_THREAD_N 8   // Threads in N direction per warp (4*8 = 32)
-#define WARP_SUBTILE_M 2  // Each thread computes this many TM-tiles in M
-#define WARP_SUBTILE_N 2  // Each thread computes this many TN-tiles in N
-
-// Verify: WARP_THREAD_M * TM_WARP * WARP_SUBTILE_M = 4 * 8 * 2 = 64 = WM ✓
-// Verify: WARP_THREAD_N * TN_WARP * WARP_SUBTILE_N = 8 * 4 * 2 = 64 = WN ✓
-
-// Threads per block: NUM_WARPS * WARP_SIZE = 4 * 32 = 128
 #define NUM_THREADS_WARP (NUM_WARPS * WARP_SIZE)
 
 __global__ void matmulWarptileKernel(const float *A, const float *B, float *C, int N) {
-    // Shared memory: As transposed
-    __shared__ float As[BK_WARP][BM_WARP];
+    // Pad BM by 1 to avoid 16-way SMEM bank conflicts during
+    // transposed write (consecutive threads write to consecutive
+    // rows of As at stride BM; when BM is a multiple of 32 every
+    // thread in the same innerRowA group hits the same bank).
+    __shared__ float As[BK_WARP][BM_WARP + 1];
     __shared__ float Bs[BK_WARP][BN_WARP];
 
-    // Warp and thread indices
     const int warpId = threadIdx.x / WARP_SIZE;
     const int laneId = threadIdx.x % WARP_SIZE;
-
-    // Warp position in block tile
-    const int warpRow = warpId / WARPS_PER_BLOCK_X;  // 0-1
-    const int warpCol = warpId % WARPS_PER_BLOCK_X;  // 0-1
-
-    // Thread position within warp tile
-    const int threadRowInWarp = laneId / WARP_THREAD_N;  // 0-3
-    const int threadColInWarp = laneId % WARP_THREAD_N;  // 0-7
-
-    // Block position in output
+    const int warpRow = warpId / WARPS_PER_BLOCK_X;
+    const int warpCol = warpId % WARPS_PER_BLOCK_X;
+    const int threadRowInWarp = laneId / WARP_THREAD_N;
+    const int threadColInWarp = laneId % WARP_THREAD_N;
     const int blockRow = blockIdx.y;
     const int blockCol = blockIdx.x;
 
-    // Move pointers to block's starting position
     A += blockRow * BM_WARP * N;
     B += blockCol * BN_WARP;
     C += blockRow * BM_WARP * N + blockCol * BN_WARP;
 
-    // Thread results: each thread computes WARP_SUBTILE_M * WARP_SUBTILE_N tiles of TM x TN
     float threadResults[WARP_SUBTILE_M * TM_WARP][WARP_SUBTILE_N * TN_WARP] = {{0.0f}};
-
-    // Registers for A and B values
     float regA[WARP_SUBTILE_M * TM_WARP];
     float regB[WARP_SUBTILE_N * TN_WARP];
 
-    // Load indices - we have 128 threads
-    // A tile: BM * BK = 128 * 16 = 2048 elements, 2048/128 = 16 per thread
-    // B tile: BK * BN = 16 * 128 = 2048 elements, 2048/128 = 16 per thread
-    const int strideA = NUM_THREADS_WARP / BK_WARP;  // 128 / 16 = 8
-    const int strideB = NUM_THREADS_WARP / BN_WARP;  // 128 / 128 = 1
-
+    const int strideA = NUM_THREADS_WARP / BK_WARP;
+    const int strideB = NUM_THREADS_WARP / BN_WARP;
     const int innerRowA = threadIdx.x / BK_WARP;
     const int innerColA = threadIdx.x % BK_WARP;
     const int innerRowB = threadIdx.x / BN_WARP;
     const int innerColB = threadIdx.x % BN_WARP;
 
-    // Loop over K dimension
     for (int tileIdx = 0; tileIdx < N; tileIdx += BK_WARP) {
-        // Load A tile (transposed into As[BK][BM])
         for (int loadOffset = 0; loadOffset < BM_WARP; loadOffset += strideA) {
             int row = innerRowA + loadOffset;
-            if (blockRow * BM_WARP + row < N && tileIdx + innerColA < N) {
+            if (blockRow * BM_WARP + row < N && tileIdx + innerColA < N)
                 As[innerColA][row] = A[row * N + innerColA];
-            } else {
+            else
                 As[innerColA][row] = 0.0f;
-            }
         }
-
-        // Load B tile
         for (int loadOffset = 0; loadOffset < BK_WARP; loadOffset += strideB) {
             int row = innerRowB + loadOffset;
-            if (tileIdx + row < N && blockCol * BN_WARP + innerColB < N) {
+            if (tileIdx + row < N && blockCol * BN_WARP + innerColB < N)
                 Bs[row][innerColB] = B[row * N + innerColB];
-            } else {
+            else
                 Bs[row][innerColB] = 0.0f;
-            }
         }
-
         __syncthreads();
-
         A += BK_WARP;
         B += BK_WARP * N;
 
-        // Compute using warp tiling
-        #pragma unroll
         for (int dotIdx = 0; dotIdx < BK_WARP; dotIdx++) {
-            // Load A values for all subtiles this thread computes
-            #pragma unroll
-            for (int subtileM = 0; subtileM < WARP_SUBTILE_M; subtileM++) {
-                #pragma unroll
-                for (int i = 0; i < TM_WARP; i++) {
-                    // Position in warp tile + subtile offset + thread offset + element
-                    int asRow = warpRow * WM + subtileM * (WM / WARP_SUBTILE_M) +
-                               threadRowInWarp * TM_WARP + i;
-                    regA[subtileM * TM_WARP + i] = As[dotIdx][asRow];
-                }
-            }
-
-            // Load B values for all subtiles
-            #pragma unroll
-            for (int subtileN = 0; subtileN < WARP_SUBTILE_N; subtileN++) {
-                #pragma unroll
-                for (int j = 0; j < TN_WARP; j++) {
-                    int bsCol = warpCol * WN + subtileN * (WN / WARP_SUBTILE_N) +
-                               threadColInWarp * TN_WARP + j;
-                    regB[subtileN * TN_WARP + j] = Bs[dotIdx][bsCol];
-                }
-            }
-
-            // Outer product for all subtiles
-            #pragma unroll
-            for (int i = 0; i < WARP_SUBTILE_M * TM_WARP; i++) {
-                #pragma unroll
-                for (int j = 0; j < WARP_SUBTILE_N * TN_WARP; j++) {
+            for (int subtileM = 0; subtileM < WARP_SUBTILE_M; subtileM++)
+                for (int i = 0; i < TM_WARP; i++)
+                    regA[subtileM * TM_WARP + i] = As[dotIdx][warpRow * WM + subtileM * (WM / WARP_SUBTILE_M) + threadRowInWarp * TM_WARP + i];
+            for (int subtileN = 0; subtileN < WARP_SUBTILE_N; subtileN++)
+                for (int j = 0; j < TN_WARP; j++)
+                    regB[subtileN * TN_WARP + j] = Bs[dotIdx][warpCol * WN + subtileN * (WN / WARP_SUBTILE_N) + threadColInWarp * TN_WARP + j];
+            for (int i = 0; i < WARP_SUBTILE_M * TM_WARP; i++)
+                for (int j = 0; j < WARP_SUBTILE_N * TN_WARP; j++)
                     threadResults[i][j] += regA[i] * regB[j];
-                }
-            }
         }
-
         __syncthreads();
     }
 
-    // Write results to global memory
-    #pragma unroll
-    for (int subtileM = 0; subtileM < WARP_SUBTILE_M; subtileM++) {
-        #pragma unroll
+    for (int subtileM = 0; subtileM < WARP_SUBTILE_M; subtileM++)
         for (int i = 0; i < TM_WARP; i++) {
-            int globalRow = blockRow * BM_WARP + warpRow * WM +
-                           subtileM * (WM / WARP_SUBTILE_M) +
-                           threadRowInWarp * TM_WARP + i;
-
-            if (globalRow < N) {
-                #pragma unroll
-                for (int subtileN = 0; subtileN < WARP_SUBTILE_N; subtileN++) {
-                    #pragma unroll
+            int globalRow = blockRow * BM_WARP + warpRow * WM + subtileM * (WM / WARP_SUBTILE_M) + threadRowInWarp * TM_WARP + i;
+            if (globalRow < N)
+                for (int subtileN = 0; subtileN < WARP_SUBTILE_N; subtileN++)
                     for (int j = 0; j < TN_WARP; j++) {
-                        int globalCol = blockCol * BN_WARP + warpCol * WN +
-                                       subtileN * (WN / WARP_SUBTILE_N) +
-                                       threadColInWarp * TN_WARP + j;
-
-                        if (globalCol < N) {
-                            int localRow = warpRow * WM + subtileM * (WM / WARP_SUBTILE_M) +
-                                          threadRowInWarp * TM_WARP + i;
-                            int localCol = warpCol * WN + subtileN * (WN / WARP_SUBTILE_N) +
-                                          threadColInWarp * TN_WARP + j;
-                            C[localRow * N + localCol] = threadResults[subtileM * TM_WARP + i][subtileN * TN_WARP + j];
-                        }
+                        int globalCol = blockCol * BN_WARP + warpCol * WN + subtileN * (WN / WARP_SUBTILE_N) + threadColInWarp * TN_WARP + j;
+                        if (globalCol < N)
+                            C[(warpRow * WM + subtileM * (WM / WARP_SUBTILE_M) + threadRowInWarp * TM_WARP + i) * N +
+                              (warpCol * WN + subtileN * (WN / WARP_SUBTILE_N) + threadColInWarp * TN_WARP + j)] =
+                                threadResults[subtileM * TM_WARP + i][subtileN * TN_WARP + j];
                     }
-                }
-            }
         }
-    }
 }
 
-MatmulWarptile::MatmulWarptile(int N, int blockDim) : N(N), blockDim(blockDim) {
-    // No workspace needed
-}
-
+MatmulWarptile::MatmulWarptile(int N, int blockDim) : N(N), blockDim(blockDim) {}
 void MatmulWarptile::execute(const float *d_A, const float *d_B, float *d_C) {
     dim3 threads(NUM_THREADS_WARP);
-    dim3 blocks((N + BN_WARP - 1) / BN_WARP,
-                (N + BM_WARP - 1) / BM_WARP);
-
+    dim3 blocks((N + BN_WARP - 1) / BN_WARP, (N + BM_WARP - 1) / BM_WARP);
     matmulWarptileKernel<<<blocks, threads>>>(d_A, d_B, d_C, N);
+    cudaCheckError(cudaGetLastError());
+}
+MatmulWarptile::~MatmulWarptile() {}
 
+// Undefine all hardcoded macros so they don't collide with autotune section
+#undef BM_WARP
+#undef BN_WARP
+#undef BK_WARP
+#undef WM
+#undef WN
+#undef TM_WARP
+#undef TN_WARP
+#undef WARP_SIZE
+#undef WARPS_PER_BLOCK_X
+#undef WARPS_PER_BLOCK_Y
+#undef NUM_WARPS
+#undef WARP_THREAD_M
+#undef WARP_THREAD_N
+#undef WARP_SUBTILE_M
+#undef WARP_SUBTILE_N
+#undef NUM_THREADS_WARP
+
+// ============================================================================
+// Templated Warp Tiling kernel (autotune version)
+// ============================================================================
+//
+// Three-level hierarchy: Block -> Warp -> Thread
+//   - Block tile: BM x BN
+//   - Warp tile:  WM x WN   (each warp computes one WM x WN region)
+//   - Thread tile: TM x TN  (each thread computes one or more TM x TN subtiles)
+//
+// Warp layout (fixed for all candidates):
+//   - 32 threads per warp, arranged as WARP_THREAD_M=4 in M, WARP_THREAD_N=8 in N
+//   - Each thread covers WM/(4*TM) * WN/(8*TN) subtiles (>= 1)
+//
+// SMEM: transposed As[BK][BM], Bs[BK][BN]. Strided loads like 2D blocktile.
+// C output: thread-local accumulator, written as local offset from warp origin.
+
+template<int BM, int BN, int BK, int TM, int TN, int WARP_M, int WARP_N>
+__global__ void matmulWarptileKernelT(const float * __restrict__ A,
+                                       const float * __restrict__ B,
+                                       float *C, int N) {
+    // Pad BM by 1 to avoid 16-way SMEM bank conflicts during
+    // transposed write (same issue as hardcoded baseline).
+    __shared__ float As[BK][BM + 1];
+    __shared__ float Bs[BK][BN];
+
+    constexpr int WARP_SIZE = 32;
+    constexpr int WARP_THREAD_M = 4;
+    constexpr int WARP_THREAD_N = 8;
+    static_assert(WARP_THREAD_M * WARP_THREAD_N == WARP_SIZE);
+
+    // Number of warps per block
+    constexpr int WARPS_X = BN / WARP_N;
+    constexpr int WARPS_Y = BM / WARP_M;
+    constexpr int NUM_WARPS = WARPS_X * WARPS_Y;
+    constexpr int NUM_THREADS = NUM_WARPS * WARP_SIZE;
+
+    // Subtiles per thread within a warp
+    constexpr int STM = WARP_M / (WARP_THREAD_M * TM);
+    constexpr int STN = WARP_N / (WARP_THREAD_N * TN);
+    static_assert(STM >= 1 && STN >= 1);
+
+    const int warpId = threadIdx.x / WARP_SIZE;
+    const int laneId = threadIdx.x % WARP_SIZE;
+    const int warpRow = warpId / WARPS_X;
+    const int warpCol = warpId % WARPS_X;
+    const int thrRow = laneId / WARP_THREAD_N;
+    const int thrCol = laneId % WARP_THREAD_N;
+    const int blockRow = blockIdx.y;
+    const int blockCol = blockIdx.x;
+
+    A += blockRow * BM * N;
+    B += blockCol * BN;
+    C += blockRow * BM * N + blockCol * BN;
+
+    float acc[STM * TM][STN * TN];
+    #pragma unroll
+    for (int i = 0; i < STM * TM; i++)
+        #pragma unroll
+        for (int j = 0; j < STN * TN; j++)
+            acc[i][j] = 0.0f;
+
+    float regA[STM * TM];
+    float regB[STN * TN];
+
+    // Strided load: each thread loads multiple elements from A and B tiles
+    constexpr int strideA = NUM_THREADS / BK;
+    constexpr int strideB = NUM_THREADS / BN;
+
+    const int innerRowA = threadIdx.x / BK;
+    const int innerColA = threadIdx.x % BK;
+    const int innerRowB = threadIdx.x / BN;
+    const int innerColB = threadIdx.x % BN;
+
+    for (int tileK = 0; tileK < N; tileK += BK) {
+        // Load A tile (transposed: As[BK][BM])
+        #pragma unroll
+        for (int off = 0; off < BM; off += strideA) {
+            int r = innerRowA + off;
+            if (blockRow * BM + r < N && tileK + innerColA < N)
+                As[innerColA][r] = A[r * N + innerColA];
+            else
+                As[innerColA][r] = 0.0f;
+        }
+        // Load B tile
+        #pragma unroll
+        for (int off = 0; off < BK; off += strideB) {
+            int r = innerRowB + off;
+            if (tileK + r < N && blockCol * BN + innerColB < N)
+                Bs[r][innerColB] = B[r * N + innerColB];
+            else
+                Bs[r][innerColB] = 0.0f;
+        }
+        __syncthreads();
+
+        A += BK;
+        B += BK * N;
+
+        #pragma unroll
+        for (int d = 0; d < BK; d++) {
+            // regA: load all subtiles in M
+            #pragma unroll
+            for (int sm = 0; sm < STM; sm++)
+                #pragma unroll
+                for (int i = 0; i < TM; i++)
+                    regA[sm * TM + i] = As[d][warpRow * WARP_M + sm * (WARP_M / STM) + thrRow * TM + i];
+
+            // regB: load all subtiles in N
+            #pragma unroll
+            for (int sn = 0; sn < STN; sn++)
+                #pragma unroll
+                for (int j = 0; j < TN; j++)
+                    regB[sn * TN + j] = Bs[d][warpCol * WARP_N + sn * (WARP_N / STN) + thrCol * TN + j];
+
+            // Outer product over all subtiles
+            #pragma unroll
+            for (int i = 0; i < STM * TM; i++)
+                #pragma unroll
+                for (int j = 0; j < STN * TN; j++)
+                    acc[i][j] += regA[i] * regB[j];
+        }
+        __syncthreads();
+    }
+
+    // Write results
+    #pragma unroll
+    for (int sm = 0; sm < STM; sm++)
+        #pragma unroll
+        for (int i = 0; i < TM; i++) {
+            int lr = warpRow * WARP_M + sm * (WARP_M / STM) + thrRow * TM + i;
+            int gr = blockRow * BM + lr;
+            if (gr < N) {
+                #pragma unroll
+                for (int sn = 0; sn < STN; sn++)
+                    #pragma unroll
+                    for (int j = 0; j < TN; j++) {
+                        int lc = warpCol * WARP_N + sn * (WARP_N / STN) + thrCol * TN + j;
+                        int gc = blockCol * BN + lc;
+                        if (gc < N)
+                            C[lr * N + lc] = acc[sm * TM + i][sn * TN + j];
+                    }
+            }
+        }
+}
+
+// ============================================================================
+// Autotuning — MatmulWarptileAuto
+// ============================================================================
+
+struct CandidateW {
+    int BM, BN, BK, TM, TN, WM, WN;
+};
+
+static const CandidateW CANDIDATES_W[] = {
+    // {BM,  BN,  BK, TM, TN, WM, WN}  SMEM = (BM*BK + BK*BN)*4 bytes
+    {128, 128, 16,  8,  4, 64,  64},   // [ 0] default-like — 4 warps, 16KB SMEM
+    {128, 128, 16, 16,  8, 64,  64},   // [ 1] bigger thread tile — same 4 warps
+    {128, 128, 16,  8,  8, 64,  64},   // [ 2] square thread tile — 4 warps
+    {128, 128,  8, 16,  8, 64,  64},   // [ 3] shallower BK — 8KB SMEM
+    {256, 128, 16, 16,  8, 64,  64},   // [ 4] taller block — 8 warps, 24KB SMEM
+    {128, 256, 16, 16,  8, 64,  64},   // [ 5] wider block — 8 warps, 24KB SMEM
+    {128, 128,  8,  8,  4, 64,  64},   // [ 6] small thread tile (like default)
+    {128, 128,  8, 16,  4, 64,  64},   // [ 7] BK=8, TM=16, square-tiled M
+    {128, 128, 16,  8,  4, 32,  32},   // [ 8] small warp tile — 16 warps
+    {128, 128, 16,  8,  4, 32,  64},   // [ 9] small warp M × medium warp N
+    {128, 128, 16,  8,  4, 64,  32},   // [10] medium warp M × small warp N
+    {128, 128,  8,  4,  4, 64,  64},   // [11] tiny thread tile — 4 warps, 1024 thr
+};
+static const int NUM_CANDIDATES_W = sizeof(CANDIDATES_W) / sizeof(CANDIDATES_W[0]);
+
+void MatmulWarptileAuto::launch(const float *d_A, const float *d_B, float *d_C,
+                                int BM, int BN, int BK, int TM, int TN, int WM, int WN) {
+    int warps_x = BN / WN;
+    int warps_y = BM / WM;
+    int num_warps = warps_x * warps_y;
+    int threads_per_block = num_warps * 32;
+    dim3 threads(threads_per_block);
+    dim3 blocks((N + BN - 1) / BN, (N + BM - 1) / BM);
+
+    #define DISPATCH(_BM, _BN, _BK, _TM, _TN, _WM, _WN) \
+        if (BM == _BM && BN == _BN && BK == _BK && TM == _TM && TN == _TN && WM == _WM && WN == _WN) { \
+            matmulWarptileKernelT<_BM, _BN, _BK, _TM, _TN, _WM, _WN><<<blocks, threads>>>(d_A, d_B, d_C, N); \
+            return; \
+        }
+
+    DISPATCH(128, 128, 16,  8,  4, 64,  64)
+    DISPATCH(128, 128, 16, 16,  8, 64,  64)
+    DISPATCH(128, 128, 16,  8,  8, 64,  64)
+    DISPATCH(128, 128,  8, 16,  8, 64,  64)
+    DISPATCH(256, 128, 16, 16,  8, 64,  64)
+    DISPATCH(128, 256, 16, 16,  8, 64,  64)
+    DISPATCH(128, 128,  8,  8,  4, 64,  64)
+    DISPATCH(128, 128,  8, 16,  4, 64,  64)
+    DISPATCH(128, 128, 16,  8,  4, 32,  32)
+    DISPATCH(128, 128, 16,  8,  4, 32,  64)
+    DISPATCH(128, 128, 16,  8,  4, 64,  32)
+    DISPATCH(128, 128,  8,  4,  4, 64,  64)
+
+    #undef DISPATCH
+
+    char err[256];
+    snprintf(err, sizeof(err),
+             "[MatmulWarptileAuto] Unsupported config: BM=%d BN=%d BK=%d TM=%d TN=%d WM=%d WN=%d",
+             BM, BN, BK, TM, TN, WM, WN);
+    throw std::runtime_error(err);
+}
+
+void MatmulWarptileAuto::tune(const float *d_A, const float *d_B, float *d_C) {
+    struct EventGuard {
+        cudaEvent_t &s, &e;
+        EventGuard(cudaEvent_t &start_, cudaEvent_t &stop_) : s(start_), e(stop_) {
+            if (cudaEventCreate(&s) != cudaSuccess)
+                throw std::runtime_error("EventGuard: cudaEventCreate failed for start");
+            if (cudaEventCreate(&e) != cudaSuccess) {
+                cudaEventDestroy(s);
+                throw std::runtime_error("EventGuard: cudaEventCreate failed for stop");
+            }
+        }
+        ~EventGuard() {
+            cudaEventDestroy(s);
+            cudaEventDestroy(e);
+        }
+    };
+    cudaEvent_t start = nullptr, stop = nullptr;
+    EventGuard guard(start, stop);
+
+    int best_idx = -1;
+    float best_ms = 1e30f;
+
+    printf("[autotune warptile N=%d] sweeping %d candidates...\n", N, NUM_CANDIDATES_W);
+
+    for (int i = 0; i < NUM_CANDIDATES_W; i++) {
+        CandidateW c = CANDIDATES_W[i];
+        int BM = c.BM, BN = c.BN, BK = c.BK, TM = c.TM, TN = c.TN, WM = c.WM, WN = c.WN;
+
+        // Validity checks
+        if (BM == 0 || BN == 0 || BK == 0 || TM == 0 || TN == 0 || WM == 0 || WN == 0) continue;
+        if (BN % WN != 0 || BM % WM != 0) continue;
+        int warps_x = BN / WN;
+        int warps_y = BM / WM;
+        int num_warps = warps_x * warps_y;
+        int threads_per_block = num_warps * 32;
+        if (threads_per_block <= 0 || threads_per_block > 1024) continue;
+        if (WM % TM != 0 || WN % TN != 0) continue;
+        // Subtiles must be integer
+        if (WM % (4 * TM) != 0 || WN % (8 * TN) != 0) continue;
+        int stm = WM / (4 * TM);
+        int stn = WN / (8 * TN);
+        if (stm < 1 || stn < 1) continue;
+        // SMEM — As is padded to BM+1 (bank-conflict avoidance)
+        int smem_bytes = (BK * (BM + 1) + BK * BN) * sizeof(float);
+        if (smem_bytes > 48 * 1024) continue;
+        // Divisibility for strided load
+        if ((BM * BK) % threads_per_block != 0) continue;
+        if ((BK * BN) % threads_per_block != 0) continue;
+        if (threads_per_block % BK != 0) continue;
+        if (threads_per_block % BN != 0) continue;
+        // N divisibility NOT required — kernel has full boundary guards
+        // (gr < N, gc < N on write; row < N, tileK + innerColA < N on load)
+
+        cudaGetLastError();
+
+        try {
+            for (int w = 0; w < 2; w++)
+                launch(d_A, d_B, d_C, BM, BN, BK, TM, TN, WM, WN);
+        } catch (const std::exception &ex) {
+            printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d TN=%2d WM=%3d WN=%3d  thr=%4d  ->  SKIPPED (launch: %s)\n",
+                   i, BM, BN, BK, TM, TN, WM, WN, threads_per_block, ex.what());
+            cudaGetLastError();
+            continue;
+        }
+        cudaDeviceSynchronize();
+        cudaError_t warmup_err = cudaGetLastError();
+        if (warmup_err != cudaSuccess) {
+            printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d TN=%2d WM=%3d WN=%3d  thr=%4d  ->  SKIPPED (%s)\n",
+                   i, BM, BN, BK, TM, TN, WM, WN, threads_per_block, cudaGetErrorString(warmup_err));
+            continue;
+        }
+
+        float times[3] = {1e30f, 1e30f, 1e30f};
+        bool failed = false;
+        for (int t = 0; t < 3; t++) {
+            cudaEventRecord(start);
+            launch(d_A, d_B, d_C, BM, BN, BK, TM, TN, WM, WN);
+            cudaEventRecord(stop);
+            if (cudaEventSynchronize(stop) != cudaSuccess ||
+                cudaEventElapsedTime(&times[t], start, stop) != cudaSuccess) {
+                failed = true;
+                break;
+            }
+        }
+        if (failed) {
+            printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d TN=%2d WM=%3d WN=%3d  thr=%4d  ->  SKIPPED (timing)\n",
+                   i, BM, BN, BK, TM, TN, WM, WN, threads_per_block);
+            cudaGetLastError();
+            continue;
+        }
+        if (times[0] > times[1]) { float t = times[0]; times[0] = times[1]; times[1] = t; }
+        if (times[1] > times[2]) { float t = times[1]; times[1] = times[2]; times[2] = t; }
+        if (times[0] > times[1]) { float t = times[0]; times[0] = times[1]; times[1] = t; }
+        float median = times[1];
+
+        double tflops = (2.0 * (double)N * N * N) / (median * 1e9);
+        printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d TN=%2d WM=%3d WN=%3d  thr=%4d smem=%2dKB  ->  %.3f ms  (%.2f TFLOPS)\n",
+               i, BM, BN, BK, TM, TN, WM, WN, threads_per_block, smem_bytes / 1024, median, tflops);
+
+        if (median < best_ms) {
+            best_ms = median;
+            best_idx = i;
+        }
+    }
+
+    if (best_idx < 0) {
+        printf("[autotune warptile N=%d] no valid candidate; fallback to default (128,128,16,8,4,64,64).\n", N);
+        best_BM = 128; best_BN = 128; best_BK = 16; best_TM = 8; best_TN = 4; best_WM = 64; best_WN = 64;
+        best_time_ms = 0.0f;
+    } else {
+        CandidateW best = CANDIDATES_W[best_idx];
+        best_BM = best.BM; best_BN = best.BN; best_BK = best.BK;
+        best_TM = best.TM; best_TN = best.TN; best_WM = best.WM; best_WN = best.WN;
+        best_time_ms = best_ms;
+        double tflops = (2.0 * (double)N * N * N) / (best_ms * 1e9);
+        printf("[autotune warptile N=%d] BEST: BM=%d BN=%d BK=%d TM=%d TN=%d WM=%d WN=%d  ->  %.3f ms  (%.2f TFLOPS)\n",
+               N, best_BM, best_BN, best_BK, best_TM, best_TN, best_WM, best_WN, best_ms, tflops);
+    }
+    tuned = true;
+}
+
+MatmulWarptileAuto::MatmulWarptileAuto(int N, int blockDim)
+    : N(N), blockDim(blockDim),
+      best_BM(128), best_BN(128), best_BK(16), best_TM(8), best_TN(4),
+      best_WM(64), best_WN(64),
+      best_time_ms(0.0f), tuned(false) {}
+
+void MatmulWarptileAuto::execute(const float *d_A, const float *d_B, float *d_C) {
+    if (!tuned)
+        tune(d_A, d_B, d_C);
+    launch(d_A, d_B, d_C, best_BM, best_BN, best_BK, best_TM, best_TN, best_WM, best_WN);
     cudaCheckError(cudaGetLastError());
 }
 
-MatmulWarptile::~MatmulWarptile() {
-    // No workspace to free
-}
+MatmulWarptileAuto::~MatmulWarptileAuto() {}
