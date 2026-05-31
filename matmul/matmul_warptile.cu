@@ -390,7 +390,8 @@ void MatmulWarptileAuto::tune(const float *d_A, const float *d_B, float *d_C) {
         if ((BK * BN) % threads_per_block != 0) continue;
         if (threads_per_block % BK != 0) continue;
         if (threads_per_block % BN != 0) continue;
-        if (N % BM != 0 || N % BN != 0) continue;
+        // N divisibility NOT required — kernel has full boundary guards
+        // (gr < N, gc < N on write; row < N, tileK + innerColA < N on load)
 
         cudaGetLastError();
 
