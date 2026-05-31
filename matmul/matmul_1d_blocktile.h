@@ -32,4 +32,32 @@ public:
     ~Matmul1DBlocktile() override;
 };
 
+// 1D Block Tiling with autotuning — sweeps (BM, BN, BK, TM) candidates the first
+// time execute() is called and caches the best config for subsequent launches.
+//
+// The candidate grid is hardcoded in matmul_1d_blocktile.cu (see CANDIDATES[]).
+// Sweep policy: 2 warmup iters + 3 timed iters per candidate, median wins.
+// The benchmark harness already runs each kernel 100x and takes the median, so
+// the one-time tuning cost gets absorbed into the median calculation.
+class Matmul1DBlocktileAuto : public MatmulKernel {
+private:
+    int N;
+    int blockDim;
+    int best_BM;
+    int best_BN;
+    int best_BK;
+    int best_TM;
+    float best_time_ms;
+    bool tuned;
+
+    void tune(const float *d_A, const float *d_B, float *d_C);
+    void launch(const float *d_A, const float *d_B, float *d_C,
+                int BM, int BN, int BK, int TM);
+
+public:
+    Matmul1DBlocktileAuto(int N, int blockDim);
+    void execute(const float *d_A, const float *d_B, float *d_C) override;
+    ~Matmul1DBlocktileAuto() override;
+};
+
 #endif
