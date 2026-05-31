@@ -238,11 +238,18 @@ void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
     // dispatch that didn't make it into the DISPATCH table). The guard creates
     // both events in its constructor and destroys them in its destructor — the
     // events are usable for the rest of this function via `start` / `stop`.
+    // If cudaEventCreate fails, the constructor throws and any partially-
+    // created event is destroyed before unwinding.
     struct EventGuard {
         cudaEvent_t &s, &e;
         EventGuard(cudaEvent_t &start_, cudaEvent_t &stop_) : s(start_), e(stop_) {
-            cudaEventCreate(&s);
-            cudaEventCreate(&e);
+            if (cudaEventCreate(&s) != cudaSuccess) {
+                throw std::runtime_error("EventGuard: cudaEventCreate failed for start");
+            }
+            if (cudaEventCreate(&e) != cudaSuccess) {
+                cudaEventDestroy(s);  // clean up the one we did create
+                throw std::runtime_error("EventGuard: cudaEventCreate failed for stop");
+            }
         }
         ~EventGuard() {
             cudaEventDestroy(s);
@@ -290,9 +297,18 @@ void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
         // post-warmup cudaGetLastError() below catches only this candidate's errors.
         cudaGetLastError();
 
-        // Warmup
-        for (int w = 0; w < 2; w++) {
-            launch(d_A, d_B, d_C, BM, BN, BK, TM, TN);
+        // Warmup. If launch() throws (e.g. an unsupported config slips through
+        // candidate validity into the DISPATCH table), catch here so we skip
+        // just this candidate instead of aborting the whole sweep.
+        try {
+            for (int w = 0; w < 2; w++) {
+                launch(d_A, d_B, d_C, BM, BN, BK, TM, TN);
+            }
+        } catch (const std::exception &ex) {
+            printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d TN=%2d  thr=%4d  ->  SKIPPED (launch threw: %s)\n",
+                   i, BM, BN, BK, TM, TN, threads_per_block, ex.what());
+            cudaGetLastError();  // clear sticky state for next candidate
+            continue;
         }
         cudaDeviceSynchronize();
 
