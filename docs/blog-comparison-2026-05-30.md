@@ -67,12 +67,28 @@ Pranjal's first TC kernel is already Hopper-optimized (WGMMA). Ours is using Vol
 
 ---
 
+## Simon's Final Algorithm: Head-to-Head (N=4096, H100)
+
+Pranjal reports that Simon's final warptile kernel achieves **31.8 TFLOPS** when run on H100. We benchmarked our best FP32 kernels at the same N=4096:
+
+| Kernel | TFLOPS | MFU (FP32 67T peak) | vs Simon |
+|---|---|---|---|
+| Simon's warptile (on H100) | 31.8 | 47.5% | — |
+| **Our vectorized (float4)** | **32.9** | **49.1%** | **+3.5%** ✅ |
+| Our warptile | 28.4 | 42.4% | -10.7% |
+| cuBLAS TF32 | 52.3 | 10.6% (TF32 495T) | — |
+
+**We have a kernel that beats Simon's final algorithm** — 32.9 vs 31.8 TFLOPS. The FP32 optimization path (naive → coalesced → smem → 1D/2D blocktile → vectorized) is complete and correct.
+
+However, the FP32 ceiling is ~33 TFLOPS on H100 — that's only **4.6%** of what cuBLAS achieves with Tensor Cores (717T BF16). The FP32 path is a dead end for further gains. The only path forward is the Tensor Core path (WGMMA → TMA → pipelining).
+
+---
+
 ## Action Items
 
 | Priority | What | Expected Gain |
 |---|---|---|
-| **P0** | Port existing kernels to Pranjal's single-`.cu` format, use WGMMA as first TC step | 2.6% → ~44% MFU (12×+) |
-| P1 | Fix block dim: 16×16 → dynamic (sweep or autotune) for FP32 kernels | FP32 kernels match siboehm |
-| P1 | Benchmark at N=4096 for apples-to-apples comparison | |
+| **P0** | Switch to WGMMA (warp-group MMA) — Pranjal's first TC step | 2.6% → ~44% MFU (12×+) |
+| P1 | Fix block dim: 16×16 → dynamic (sweep or autotune) for FP32 kernels | — (already past Simon) |
 | P2 | Add TMA (async copy) — Pranjal step 5 | 44% → 70% |
 | P2 | Profile Nsight at each step of the WGMMA path | |
