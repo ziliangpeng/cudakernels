@@ -12,14 +12,14 @@
 
 **Both sides compared against their own cuBLAS FP32 baseline.** Simon's % are from his A100 blog. Our % are vs our cuBLAS FP32 at the same N.
 
-| | Our cuBLAS FP32 (2K) | Our cuBLAS FP32 (4K) | Simon's cuBLAS FP32 (4K) |
+| | cuBLAS FP32 2K H100 | cuBLAS FP32 4K H100 | cuBLAS FP32 (Simon A100) |
 |---|---|---|---|
 | Baseline | 50.4 TFLOPS | 52.2 TFLOPS | 23.2 TFLOPS (A100) |
 | Source | [`matmul_cublas.cu`](matmul_cublas.cu) | same | — |
 
 Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autotunes.
 
-| Step | Src | Ours 2K | Ours 4K | Simon 4K | Gap (vs Simon 4K) |
+| Step | Src | 2K H100 | 4K H100 | Simon 4K A100 | Gap (vs Simon 4K) |
 |---|---|---|---|---|---|
 | Naive | [link](matmul_naive.cu) | — | — | 1.3% (0.3 T) | — |
 | Coalesced | [link](matmul_coalesced.cu) | 13.1% (6.6 T) | 10.9% (5.7 T) | 8.5% (2.0 T) | +2.4pp ✅ |
