@@ -490,13 +490,13 @@ Implemented `Matmul2DBlocktileAuto` (see `matmul_2d_blocktile.cu`). 15-candidate
 
 | # | BM | BN | BK | TM | TN | Threads | SMEM | TFLOPS |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16KB** | **33.73** |
+| **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16KB** | **34.03** |
 | 2 | 128 | 128 | 8 | 16 | 8 | 128 | 8KB | 32.40 |
 | 11 | 256 | 128 | 16 | 16 | 8 | 256 | 24KB | 31.54 |
 | 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12KB | 29.02 |
 | 4 | 128 | 128 | 16 | 8 | 8 | 256 | 16KB | 28.55 |
 | 13 | 128 | 128 | 16 | 8 | **16** | 128 | 16KB | 23.74 |
-| 0 (default) | 128 | 128 | 8 | 8 | 8 | 256 | 8KB | 22.24 |
+| 0 (default) | 128 | 128 | 8 | 8 | 8 | 256 | 8KB | 22.29 |
 | 12 | 128 | 128 | **32** | 16 | 8 | 128 | 32KB | 22.47 |
 | 7 | 128 | 128 | 8 | 4 | 4 | 1024 | 8KB | 21.50 |
 | 14 | 256 | 256 | 16 | 16 | 8 | 512 | — | SKIPPED (register spill) |
@@ -513,10 +513,10 @@ Implemented `Matmul2DBlocktileAuto` (see `matmul_2d_blocktile.cu`). 15-candidate
 | Outputs per thread | 64 | 128 | 2× |
 | Register accumulators / thread | 64 | 128 | 2× |
 | K-loop iterations (N=4096) | 512 | 256 | ½× |
-| Median time | 6.18 ms | 4.07 ms | −34% |
-| **TFLOPS** | **22.24** | **33.73** | **+51.7%** |
+| Median time | 6.17 ms | 4.04 ms | −34% |
+| **TFLOPS** | **22.29** | **34.03** | **+52.7%** |
 
-The +52% jump pushes 2D blocktile from 42.9% to **64.6%** of cuBLAS FP32, closing most of the gap to Simon's autotuned A100 (68.7%) and beating Simon's autotuned warptile running on H100 (60.9%).
+The +52% jump pushes 2D blocktile from 42.7% to **65.2%** of cuBLAS FP32, closing most of the gap to Simon's autotuned A100 (68.7%) and beating Simon's autotuned warptile running on H100 (60.9%).
 
 ### Four lessons from the sweep
 
@@ -524,7 +524,7 @@ The +52% jump pushes 2D blocktile from 42.9% to **64.6%** of cuBLAS FP32, closin
 
 ```
 BK=8   → 32.40 TFLOPS  (candidate 2)
-BK=16  → 33.73 TFLOPS  (candidate 10) ← peak
+BK=16  → 34.03 TFLOPS  (candidate 10) ← peak
 BK=32  → 22.47 TFLOPS  (candidate 12) ← collapse
 ```
 
@@ -537,7 +537,7 @@ Earlier drafts of this doc cited a BK=24 datapoint at 27.7T. That number was **i
 The most surprising finding:
 
 ```
-TM=16, TN= 8 → 33.73 TFLOPS  (candidate 10)
+TM=16, TN= 8 → 34.03 TFLOPS  (candidate 10)
 TM= 8, TN=16 → 23.96 TFLOPS  (candidate 13) ← −30% from a mirror swap
 ```
 
@@ -550,7 +550,7 @@ This is one of those autotune findings that **no theory paper would tell you**. 
 #### Lesson 3: Bigger block ≠ better when occupancy already saturates
 
 ```
-BM=128, BN=128  →  33.73 TFLOPS  (candidate 10)
+BM=128, BN=128  →  34.03 TFLOPS  (candidate 10)
 BM=256, BN=128  →  31.54 TFLOPS  (candidate 11)
 BM=256, BN=256  →  REGISTER SPILL  (candidate 14)
 ```
@@ -559,7 +559,7 @@ Once the SM has enough concurrent blocks/warps to hide latency, making each bloc
 
 #### Lesson 4: Default is one of the worst (again)
 
-The hardcoded `(128, 128, 8, 8, 8)` siboehm-A100 default ranks **7th of 15** at 22.45T. Almost everything in the grid except the obvious bad configs (small TM/TN, mirror-swapped, oversized) beats the default. This re-confirms what 1D blocktile's autotune showed: H100 prefers smaller threads/block, larger thread tiles, and deeper BK than A100.
+The hardcoded `(128, 128, 8, 8, 8)` siboehm-A100 default ranks **8th of 19** at 22.29T. Almost everything in the grid except the obvious bad configs (small TM/TN, mirror-swapped, oversized) beats the default. This re-confirms what 1D blocktile's autotune showed: H100 prefers smaller threads/block, larger thread tiles, and deeper BK than A100.
 
 ### Reproducibility check
 
