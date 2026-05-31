@@ -29,8 +29,9 @@ Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autot
 | 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (21.6 T) | 42.9% (22.4 T) | 68.7% (16.0 T) | **−25.8pp** ⚠️ |
 | **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | — | **65.2% (34.0 T)** | 68.7% (16.0 T) | **−3.5pp** ✅ |
 | Vectorized | [link](matmul_vectorized.cu) | 65.1% (32.8 T) | 63.0% (32.9 T) | 78.4% (18.2 T) | −15.4pp |
-| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | — | **66.7% (34.8 T)** | — | — |
+| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | — | **66.7% (34.8 T)** | 78.4% (18.2 T) | −11.7pp |
 | Warptile | [link](matmul_warptile.cu) | 56.3% (28.4 T) | 54.2% (28.3 T) | **93.7%** (21.8 T) | **−39.5pp** ⚠️⚠️ |
+| **Warptile (autotuned)** | [link](matmul_warptile.cu) | — | **64.4% (33.4 T)** | 93.7% (21.8 T) | **−29.3pp** |
 | Autotuning | — | — | — | 84.8% (19.7 T) | — |
 
 Each `link` in the Src column points to the corresponding `matmul_<step>.cu` file in this directory.
@@ -62,8 +63,9 @@ Pranjal ran Simon's final (autotuned) warptile kernel on H100 and got **31.8 TFL
 | Simon's warptile (on H100) | 31.8 | 60.9% | 47.5% |
 | **Our vectorized** | **32.9** | **63.0%** | **49.1%** |
 | Our warptile | 28.3 | 54.2% | 42.2% |
+| **Our warptile (autotuned)** | **33.4** | **64.4%** | **49.9%** |
 
-**We beat Simon on absolute TFLOPS** (32.9 > 31.8) despite lacking autotuning. Our warptile regresses because the hardcoded warp tile parameters are wrong for H100 — with autotuning it should beat vectorized, not lose to it.
+**We beat Simon on absolute TFLOPS** with both vectorized (32.9 T > 31.8 T) and autotuned warptile (33.4 T > 31.8 T). The hardcoded warptile regressed because its warp tile parameters were wrong for H100 — autotuning closed the gap (+5.1 T, +18%), confirming the parameter-tuning diagnosis.
 
 ### FP32 Ceiling
 
@@ -111,7 +113,7 @@ Note: our WMMA at 4K (5.7%, 27.5T) is better than at 2K (2.6%, 25.6T) — larger
 
 | Path | Progress | Key Blocker | Next Step |
 |---|---|---|---|
-| **FP32** (Simon) | 7/7 done, beats Simon (32.9 > 31.8 T) | No autotuning (warptile regresses) | Low priority — FP32 ceiling ~52T |
+| **FP32** (Simon) | 8/8 done, beats Simon (33.4 > 31.8 T) | FP32 ceiling ~52T | Low priority — tapped out |
 | **TC** (Pranjal) | 0/10 done, WMMA at 5.7% | WMMA API (need WGMMA) | **WGMMA** — step 1 of 10 |
 
 ---
@@ -121,6 +123,6 @@ Note: our WMMA at 4K (5.7%, 27.5T) is better than at 2K (2.6%, 25.6T) — larger
 | Priority | What | Expected Gain |
 |---|---|---|
 | **P0** | WGMMA — Pranjal K1 | 5.7% → ~44% (7.8×) |
-| P1 | Autotune BM/BN/BK for FP32 warptile | 28.3T → ~35T (+24%, low ROI vs TC) |
+| ~~P1~~ | ~~Autotune warptile~~ | ~~✅ Done: 28.3→33.4T (+18%)~~ |
 | P2 | TMA (async copy) — Pranjal K3 | 44% → 70% |
 | P2 | Nsight profile each WGMMA step | |
