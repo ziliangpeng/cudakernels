@@ -293,6 +293,45 @@ HBM tile  →  SMEM tile  →  Register tile  →  Tensor Core fragment
 
 Each level of tiling unlocks reuse at the next level of the hierarchy. CUTLASS systematizes this: every tile size is a template parameter. WGMMA / Tensor Core kernels add one more layer (the fragment tile fed to `wgmma.mma_async`). Same idea, more layers — every extra tile level absorbs another bandwidth bottleneck.
 
+### Autotune result (2026-05-30)
+
+Implemented `Matmul1DBlocktileAuto` (see `matmul_1d_blocktile.cu`) — first time `execute()` is called, it sweeps 7 legal `(BM, BK, TM)` candidates and caches the best for subsequent launches. The benchmark harness already takes a median over 100 iterations, so the one-time sweep cost gets absorbed.
+
+**Kernel constraint exposed by the sweep**: the original 1D blocktile uses a 1-element-per-thread load (`innerRowA = tid/BK`, `innerColA = tid%BK`), which requires `NUM_THREADS == BM*BK == BK*BN == (BM*BN)/TM`. This forces **BM = BN and BM = BK·TM**, eliminating asymmetric tiles from the candidate grid. A truly general 1D blocktile would need a strided load like 2D blocktile uses; we deferred that change to keep this autotune step minimal.
+
+**Result at N=4096**:
+
+| Candidate | BM=BN | BK | TM | Threads | Outputs/thread | TFLOPS |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 | 32 | 4 | 8 | 128 | 8 | 15.47 |
+| 1 | 32 | 8 | 4 | 256 | 4 | 15.14 |
+| **2 (BEST)** | **64** | **4** | **16** | **256** | **16** | **19.26** |
+| 3 | 64 | 16 | 4 | 1024 | 4 | 12.13 |
+| 4 (default) | 64 | 8 | 8 | 512 | 8 | 17.63 |
+| 5 | 128 | 8 | 16 | 1024 | 16 | 18.22 |
+| 6 | 128 | 16 | 8 | (2048 > 1024) | — | skipped |
+
+**Default vs Best comparison**:
+
+| | Default (candidate 4) | Best (candidate 2) | Delta |
+|---|---|---|---|
+| `(BM=BN, BK, TM)` | `(64, 8, 8)` | `(64, 4, 16)` | — |
+| Threads per block | 512 | 256 | ½× |
+| Outputs per thread | 8 | 16 | 2× |
+| SMEM per block | 4 KB | 2 KB | ½× |
+| Register accumulators / thread | 8 | 16 | 2× |
+| K-loop iterations (N=4096) | 512 | 1024 | 2× |
+| Median time | 7.79 ms | 7.14 ms | −8.4% |
+| **TFLOPS** | **17.64** | **19.26** | **+9.2%** |
+
+The +9% jump came from a tile that's smaller in BK but bigger in TM — the opposite of "make tiles bigger". The winning config pushes the 1D blocktile core idea further: more register reuse per thread (16× instead of 8×). 256 threads/block is enough to hide latency, and the smaller SMEM footprint lets more blocks coexist per SM, keeping occupancy high.
+
+**Bad config worth noting**: candidate 3 `(64, 16, 4)` is the *worst* at 12.13 TFLOPS even though it uses 1024 threads. With TM=4, each thread only computes 4 outputs → register reuse factor drops back near 1 → SMEM port pressure rises → throughput craters. This is direct empirical confirmation that **register reuse (TM), not thread count, is what drives 1D blocktile performance**.
+
+**Algorithm ceiling visible**: even with the best 1D config, we only reach 19.3 TFLOPS — still well below 2D blocktile's 22.4 TFLOPS. 1D blocktile only reuses B in registers (not A), so even maximal TM cannot close the gap to 2D's `TM × TN = 64×` reuse. **Autotuning finds the best within an algorithm's ceiling; only a new algorithm raises the ceiling.**
+
+See [`autotune.md`](autotune.md) for the autotune harness design and lessons learned, and [`blog-comparison-2026-05-30.md`](blog-comparison-2026-05-30.md) for the updated comparison table including the autotuned row.
+
 ---
 
 ## Step 5: 2D Blocktile — Register Reuse on Both A and B (Outer Product)
