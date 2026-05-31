@@ -5,49 +5,41 @@
 #include <stdexcept>
 
 // ============================================================================
-// Templated Vectorized Memory Access kernel
+// Templated Vectorized kernel — 2D blocktile + float4 C stores
 // ============================================================================
 //
-// Key difference from 2D blocktile: As is stored transposed (As[BK][BM] instead
-// of As[BM][BK]) so the inner product loop reads As[dotIdx][row] — a coalesced
-// sequential access pattern along the BM dimension of SMEM.
+// Same structure as 2D blocktile (non-transposed As[BM][BK], strided scalar
+// GMEM loads, outer product compute) PLUS float4 (128-bit) stores for C output.
 //
-// Built on 2D blocktile's strided-load pattern + outer product, adding:
-//   - float4 (128-bit) stores to global memory for C output (TN must be ≥ 4)
-//   - Stack-split index calculation to avoid NVCC register pressure (each index
-//     computed in its own scope with minimal liveness)
-//   - Transposed As layout for coalesced SMEM reads
+// The float4 store exploits H100's 128-byte L1 cache sector: 8 consecutive
+// float writes from the same warp → fewer L1 transactions for the C output
+// phase.
 //
-// All boundary checks preserved for arbitrary N.
+// Boundary handling: fallback to scalar stores when the last partial column
+// of C doesn't have 4+ elements remaining.
 
 template<int BM, int BN, int BK, int TM, int TN>
 __global__ void matmulVectorizedKernelT(const float * __restrict__ A,
                                         const float * __restrict__ B,
                                         float *C, int N) {
-    // As is TRANSPOSED: As[k][m] instead of As[m][k]
-    // This makes the inner loop read As[dotIdx][threadRow * TM + i] which is
-    // coalesced (sequential BM-dimension access across threads)
-    __shared__ float As[BK][BM];
+    // Non-transposed As[BM][BK] — same layout as 2D blocktile winner
+    __shared__ float As[BM][BK];
     __shared__ float Bs[BK][BN];
 
-    {   // Block position — minimal lifetime
-        const int blockRow = blockIdx.y;
-        const int blockCol = blockIdx.x;
-        A += blockRow * BM * N;
-        B += blockCol * BN;
-        C += blockRow * BM * N + blockCol * BN;
-    }
-
-    // Thread position in output tile
     const int threadCol = threadIdx.x % (BN / TN);
     const int threadRow = threadIdx.x / (BN / TN);
 
-    // Accumulators
+    const int blockRow = blockIdx.y;
+    const int blockCol = blockIdx.x;
+
+    A += blockRow * BM * N;
+    B += blockCol * BN;
+    C += blockRow * BM * N + blockCol * BN;
+
     float threadResults[TM][TN] = {{0.0f}};
     float regA[TM];
     float regB[TN];
 
-    // Load indices — computed once, reused across K iterations
     constexpr int NUM_THREADS = (BM / TM) * (BN / TN);
     constexpr int strideA = NUM_THREADS / BK;
     constexpr int strideB = NUM_THREADS / BN;
@@ -58,29 +50,26 @@ __global__ void matmulVectorizedKernelT(const float * __restrict__ A,
     const int innerColB = threadIdx.x % BN;
 
     for (int tileIdx = 0; tileIdx < N; tileIdx += BK) {
-        // Load A tile (strided) — store TRANSPOSED into As[BK][BM]
-        // This is the key difference from 2D blocktile: As[k][m] = A[m][k]
-        // ensures coalesced inner-loop reads
+        // Load A tile (strided scalar) — same as 2D blocktile
         #pragma unroll
         for (int loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
-            int row = innerRowA + loadOffset;
-            float val = 0.0f;
-            if (blockIdx.y * BM + row < N && tileIdx + innerColA < N) {
-                val = A[row * N + innerColA];
+            int row = innerRowA + loadOffset;  // rows 0..BM-1
+            if (blockRow * BM + row < N && tileIdx + innerColA < N) {
+                As[row][innerColA] = A[row * N + innerColA];
+            } else {
+                As[row][innerColA] = 0.0f;
             }
-            // Store transposed: As[k][m]
-            As[innerColA][row] = val;
         }
 
-        // Load B tile (strided) — same layout as 2D blocktile
+        // Load B tile (strided scalar) — same as 2D blocktile
         #pragma unroll
         for (int loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
             int row = innerRowB + loadOffset;
-            float val = 0.0f;
-            if (tileIdx + row < N && blockIdx.x * BN + innerColB < N) {
-                val = B[row * N + innerColB];
+            if (tileIdx + row < N && blockCol * BN + innerColB < N) {
+                Bs[row][innerColB] = B[row * N + innerColB];
+            } else {
+                Bs[row][innerColB] = 0.0f;
             }
-            Bs[row][innerColB] = val;
         }
 
         __syncthreads();
@@ -88,13 +77,12 @@ __global__ void matmulVectorizedKernelT(const float * __restrict__ A,
         A += BK;
         B += BK * N;
 
-        // Outer product compute
-        // As[dotIdx][threadRow * TM + i] — coalesced read
+        // Outer product compute — same as 2D blocktile
         #pragma unroll
         for (int dotIdx = 0; dotIdx < BK; dotIdx++) {
             #pragma unroll
             for (int i = 0; i < TM; i++) {
-                regA[i] = As[dotIdx][threadRow * TM + i];
+                regA[i] = As[threadRow * TM + i][dotIdx];
             }
             #pragma unroll
             for (int j = 0; j < TN; j++) {
@@ -112,16 +100,14 @@ __global__ void matmulVectorizedKernelT(const float * __restrict__ A,
         __syncthreads();
     }
 
-    // Write results to global memory using float4 (128-bit stores)
-    // This exploits the 128-byte L1 cache line on H100 — 8 consecutive writes
-    // from the same warp hit one L1 sector
+    // Write results using float4 (128-bit) stores — the key optimization
     #pragma unroll
     for (int i = 0; i < TM; i++) {
-        int globalRow = blockIdx.y * BM + threadRow * TM + i;
+        int globalRow = blockRow * BM + threadRow * TM + i;
         if (globalRow < N) {
             #pragma unroll
             for (int j = 0; j < TN; j += 4) {
-                int globalCol = blockIdx.x * BN + threadCol * TN + j;
+                int globalCol = blockCol * BN + threadCol * TN + j;
                 if (globalCol + 3 < N) {
                     float4 tmp;
                     tmp.x = threadResults[i][j + 0];
@@ -131,6 +117,7 @@ __global__ void matmulVectorizedKernelT(const float * __restrict__ A,
                     *reinterpret_cast<float4*>(
                         &C[(threadRow * TM + i) * N + threadCol * TN + j]) = tmp;
                 } else {
+                    #pragma unroll
                     for (int k = 0; k < 4 && globalCol + k < N; k++) {
                         C[(threadRow * TM + i) * N + threadCol * TN + j + k]
                             = threadResults[i][j + k];
@@ -143,7 +130,8 @@ __global__ void matmulVectorizedKernelT(const float * __restrict__ A,
 
 // ============================================================================
 // Original (hardcoded) MatmulVectorized — kept as baseline.
-// Uses BM=BN=128, BK=8, TM=TN=8 (same as siboehm Kernel 6).
+// Uses float4 GMEM loads + transposed As + float4 C stores.
+// BM=BN=128, BK=8, TM=TN=8.
 // ============================================================================
 
 #define BM_VEC 128
@@ -178,7 +166,7 @@ __global__ void matmulVectorizedKernel(const float *A, const float *B, float *C,
     const int innerColB = threadIdx.x % (BN_VEC / 4);
 
     for (int tileIdx = 0; tileIdx < N; tileIdx += BK_VEC) {
-        // Load A with float4 (original implementation), store transposed
+        // Load A with float4, store transposed into As[BK][BM]
         if (innerRowA < BM_VEC && blockRow * BM_VEC + innerRowA < N) {
             float4 tmp = {0.0f, 0.0f, 0.0f, 0.0f};
             if (tileIdx + innerColA * 4 + 3 < N) {
@@ -243,7 +231,7 @@ __global__ void matmulVectorizedKernel(const float *A, const float *B, float *C,
         __syncthreads();
     }
 
-    // Write results to global memory using float4
+    // Write results using float4
     #pragma unroll
     for (int i = 0; i < TM_VEC; i++) {
         int globalRow = blockRow * BM_VEC + threadRow * TM_VEC + i;
@@ -286,12 +274,12 @@ MatmulVectorized::~MatmulVectorized() {}
 // Autotuning version — MatmulVectorizedAuto
 // ============================================================================
 //
-// ~16-candidate sweep across (BM, BN, BK, TM, TN). Same validity constraints
-// as 2D blocktile autotune plus TN must be divisible by 4 (for float4 stores).
+// Uses 2D blocktile structure (non-transposed As[BM][BK], strided scalar
+// GMEM loads) + float4 C stores. Same ~15-candidate sweep as 2D autotune
+// with TN % 4 == 0 constraint for float4 store alignment.
 //
-// The transposed As layout means the inner product loop reads coalesced from
-// SMEM (As[dotIdx][row]), which may improve performance vs the 2D blocktile's
-// non-transposed layout even at the same candidate parameters.
+// This directly answers: does float4 C store add anything on top of the 2D
+// blocktile winner's scalar stores?
 
 struct CandidateVec {
     int BM, BN, BK, TM, TN;
@@ -318,7 +306,6 @@ static const CandidateVec CANDIDATES_VEC[] = {
 };
 static const int NUM_CANDIDATES_VEC = sizeof(CANDIDATES_VEC) / sizeof(CANDIDATES_VEC[0]);
 
-// Dispatch table
 void MatmulVectorizedAuto::launch(const float *d_A, const float *d_B, float *d_C,
                                   int BM, int BN, int BK, int TM, int TN) {
     int threads_per_block = (BM / TM) * (BN / TN);
@@ -361,9 +348,8 @@ void MatmulVectorizedAuto::tune(const float *d_A, const float *d_B, float *d_C) 
     struct EventGuard {
         cudaEvent_t &s, &e;
         EventGuard(cudaEvent_t &start_, cudaEvent_t &stop_) : s(start_), e(stop_) {
-            if (cudaEventCreate(&s) != cudaSuccess) {
+            if (cudaEventCreate(&s) != cudaSuccess)
                 throw std::runtime_error("EventGuard: cudaEventCreate failed for start");
-            }
             if (cudaEventCreate(&e) != cudaSuccess) {
                 cudaEventDestroy(s);
                 throw std::runtime_error("EventGuard: cudaEventCreate failed for stop");
@@ -387,7 +373,7 @@ void MatmulVectorizedAuto::tune(const float *d_A, const float *d_B, float *d_C) 
         int BM = c.BM, BN = c.BN, BK = c.BK, TM = c.TM, TN = c.TN;
         int threads_per_block = (BM / TM) * (BN / TN);
 
-        // Validity checks
+        // Validity checks (same as 2D blocktile + TN%4==0 for float4 stores)
         if (threads_per_block > 1024) continue;
         if (BM % TM != 0 || BN % TN != 0) continue;
         if ((BM * BK) % threads_per_block != 0) continue;
@@ -402,9 +388,8 @@ void MatmulVectorizedAuto::tune(const float *d_A, const float *d_B, float *d_C) 
         cudaGetLastError();
 
         try {
-            for (int w = 0; w < 2; w++) {
+            for (int w = 0; w < 2; w++)
                 launch(d_A, d_B, d_C, BM, BN, BK, TM, TN);
-            }
         } catch (const std::exception &ex) {
             printf("  [%2d] BM=%3d BN=%3d BK=%2d TM=%2d TN=%2d  thr=%4d  ->  SKIPPED (launch threw: %s)\n",
                    i, BM, BN, BK, TM, TN, threads_per_block, ex.what());
@@ -437,6 +422,7 @@ void MatmulVectorizedAuto::tune(const float *d_A, const float *d_B, float *d_C) 
             cudaGetLastError();
             continue;
         }
+        // Sort to find median
         if (times[0] > times[1]) { float t = times[0]; times[0] = times[1]; times[1] = t; }
         if (times[1] > times[2]) { float t = times[1]; times[1] = times[2]; times[2] = t; }
         if (times[0] > times[1]) { float t = times[0]; times[0] = times[1]; times[1] = t; }
@@ -453,7 +439,7 @@ void MatmulVectorizedAuto::tune(const float *d_A, const float *d_B, float *d_C) 
     }
 
     if (best_idx < 0) {
-        printf("[autotune vectorized N=%d] no candidate passed validity; falling back to default (128,128,8,8,8).\n", N);
+        printf("[autotune vectorized N=%d] no candidate passed validity; fallback to (128,128,8,8,8).\n", N);
         best_BM = 128; best_BN = 128; best_BK = 8; best_TM = 8; best_TN = 8;
         best_time_ms = 0.0f;
     } else {
