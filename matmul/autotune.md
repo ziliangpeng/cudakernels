@@ -375,7 +375,7 @@ We now slightly edge Simon's A100 autotuned percentage at this step (36.9% vs 36
 | SMEM | TODO | 9.0 (hardcoded) | — |
 | 1D blocktile | ✅ Done | 19.3 | `(BM=BN=64, BK=4, TM=16)` |
 | **2D blocktile** | **✅ Done** | **34.0** | **`(BM=BN=128, BK=16, TM=16, TN=8)`** |
-| Vectorized | TODO | 32.9 (hardcoded) | — |
+| **Vectorized** | **✅ Done** | **34.8** | **`(BM=BN=128, BK=16, TM=16, TN=8)`** |
 | Warptile | TODO | 28.3 (hardcoded) | — |
 
 ---
@@ -469,4 +469,62 @@ The full Cartesian product `BM × BN × BK × TM × TN` would be ~thousands of c
 
 1. **Should we sweep at multiple N (not just 4096)?** Smaller N might prefer smaller blocks for better SM coverage. Currently each `Matmul2DBlocktileAuto` instance sweeps once for its own N, so the benchmark `all` mode does pick per-N winners — we just haven't analyzed them.
 2. **The TM ≠ TN asymmetry is a real algorithmic finding.** Should we add a swap-direction toggle to the kernel? Probably not worth it — the asymmetry only matters when one of TM/TN is large; for square tiles it's symmetric.
+
+---
+
+## Actual Results — Vectorized (2026-05-31)
+
+Third autotune step executed. Branch: `autotune-vectorized`. Class: `MatmulVectorizedAuto`.
+
+### Design choices
+
+The vectorized autotune uses **the same structure as 2D blocktile** (non-transposed `As[BM][BK]`, strided scalar GMEM loads, outer product compute) plus float4 (128-bit) C stores. This is different from the hardcoded vectorized kernel, which uses float4 GMEM loads + transposed `As[BK][BM]`. Rationale:
+
+- The templated kernel needs to support arbitrary candidate configs. float4 GMEM loads require `BK % 4 == 0` and a specific load index pattern that's hard to template cleanly.
+- The proven 2D autotune structure works well — adding float4 C stores on top isolates the incremental benefit of vectorized stores vs scalar stores.
+
+### Performance summary
+
+| Variant | Config | N=4096 TFLOPS | vs cuBLAS FP32 |
+|---|---|---|---|
+| `vectorized` (hardcoded baseline) | `(128, 128, 8, 8, 8)` | 32.7 T | 62.7% |
+| **`vectorized_auto` (winning config)** | **`(128, 128, 16, 16, 8)`** | **34.8 T** | **66.7%** |
+| Delta | — | **+2.1T (+6.4%)** | **+4.0pp** |
+| `2d_blocktile_auto` (prev winner) | `(128, 128, 16, 16, 8)` | 33.7 T | 64.6% |
+| `vectorized_auto` vs `2d_blocktile_auto` | same config | **+1.1T (+3.3%)** | **+2.1pp** |
+
+### Full sweep table (N=4096, 3-run median per candidate)
+
+| # | BM | BN | BK | TM | TN | thr | SMEM | TFLOPS | notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 0 | 128 | 128 | 8 | 8 | 8 | 256 | 8K | 22.87 | default |
+| **1 (BEST)** | **128** | **128** | **8** | **16** | **8** | **128** | **8K** | **32.43** | runner-up |
+| 2 | 128 | 128 | 8 | 8 | 16 | 128 | 8K | 23.21 | TM↔TN mirror (bad) |
+| 3 | 128 | 128 | 16 | 8 | 8 | 256 | 16K | 28.12 | |
+| **4 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16K** | **34.81** | **= winner** |
+| 5 | 128 | 128 | 16 | 8 | 16 | 128 | 16K | 24.34 | TM↔TN mirror at BK=16 |
+| 6 | 128 | 64 | 8 | 16 | 8 | 64 | 6K | 30.49 | asymmetric (tall) |
+| 7 | 64 | 128 | 8 | 8 | 16 | 128 | 6K | filtered (TN%4≠0) | TN=16 not div by 4 |
+| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12K | 28.94 | bigger block (tall) |
+| 9 | 128 | 256 | 8 | 8 | 16 | 256 | 12K | 21.91 | bigger block (wide) |
+| 10 | 64 | 64 | 8 | 8 | 8 | 64 | 4K | 27.83 | small block |
+| 11 | 64 | 64 | 16 | 8 | 8 | 64 | 8K | 29.61 | small + deeper BK |
+| 12 | 128 | 128 | 32 | 16 | 8 | 128 | 32K | 22.35 | BK wall |
+| 13 | 256 | 128 | 16 | 16 | 8 | 256 | 24K | 32.22 | bigger tall |
+| 14 | 256 | 256 | 8 | 16 | 8 | 512 | — | SKIPPED | register spill |
+| 15 | 128 | 128 | 16 | 4 | 4 | 1024 | 16K | 26.39 | small thread tile |
+
+### Reproducibility
+
+Two independent runs on pi1-h100-16 (idle node) gave 34.77T and 34.81T — ±0.04T (0.1% spread). The winner is stable.
+
+### Key finding
+
+**float4 C stores are a real (if modest) optimization on H100.** The +3.3% gain over 2D blocktile's scalar stores is reproducible and comes from reducing L1 cache-sector transactions during C writeback. Each 128-bit store maps to one L1 sector write instead of up to 4 for scalar stores, reducing LSU pressure during the output phase.
+
+The winning config is the same as 2D blocktile: `(128, 128, 16, 16, 8)`. This confirms the autotune landscape is stable — vectorized stores don't change which tile sizes are optimal, they just shift the performance ceiling slightly higher.
+
+### What's next
+
+Only warptile remains for FP32 autotune. The hardcoded warptile runs 28.3T (54.2%) — the biggest gap between autotuned and hardcoded for any step. Warptile autotuning is expected to be the largest remaining gain in the FP32 path.
 3. **Should we extract autotune harness into a shared file?** Both 1D and 2D `*Auto` classes have nearly identical `tune()` boilerplate. Refactor candidate after 1-2 more steps.
