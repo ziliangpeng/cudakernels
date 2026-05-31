@@ -22,8 +22,14 @@ template<int BM, int BN, int BK, int TM, int TN>
 __global__ void matmulVectorizedKernelT(const float * __restrict__ A,
                                         const float * __restrict__ B,
                                         float *C, int N) {
-    // Non-transposed As[BM][BK] — same layout as 2D blocktile winner
-    __shared__ float As[BM][BK];
+    // Non-transposed As[BM][BK] — same layout as 2D blocktile winner.
+    // Pad inner dim by 1 (BK+1) to break bank conflicts: the inner-loop reads
+    // As[threadRow*TM + i][dotIdx]; with BK=16, TM=16 the stride between the
+    // two threadRow groups in a warp is TM*BK = 256 = 8*32 → same SMEM bank
+    // → 2-way conflict. (BK+1) makes the stride odd*TM, breaking the conflict
+    // at the cost of 512 extra bytes for BM=128. Gemini Code Assist caught
+    // this in PR #4 review.
+    __shared__ float As[BM][BK + 1];
     __shared__ float Bs[BK][BN];
 
     const int threadCol = threadIdx.x % (BN / TN);
@@ -294,7 +300,7 @@ static const CandidateVec CANDIDATES_VEC[] = {
     {128, 128, 16, 16,  8},   // [ 4] BK=16 + big TM (2D winner)
     {128, 128, 16,  8, 16},   // [ 5] BK=16 + big TN
     {128,  64,  8, 16,  8},   // [ 6] asymmetric (tall) — 128 thr, 6KB
-    { 64, 128,  8,  8, 16},   // [ 7] asymmetric (wide) — 128 thr, 6KB
+    { 64, 128,  8,  8,  8},   // [ 7] asymmetric (wide) — 128 thr, 6KB
     {256, 128,  8, 16,  8},   // [ 8] bigger block (tall) — 256 thr, 12KB
     {128, 256,  8,  8, 16},   // [ 9] bigger block (wide) — 256 thr, 12KB
     { 64,  64,  8,  8,  8},   // [10] smaller block — 64 thr, 4KB
@@ -325,7 +331,7 @@ void MatmulVectorizedAuto::launch(const float *d_A, const float *d_B, float *d_C
     DISPATCH(128, 128, 16, 16,  8)
     DISPATCH(128, 128, 16,  8, 16)
     DISPATCH(128,  64,  8, 16,  8)
-    DISPATCH( 64, 128,  8,  8, 16)
+    DISPATCH( 64, 128,  8,  8,  8)
     DISPATCH(256, 128,  8, 16,  8)
     DISPATCH(128, 256,  8,  8, 16)
     DISPATCH( 64,  64,  8,  8,  8)
