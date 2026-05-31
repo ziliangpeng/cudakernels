@@ -29,7 +29,11 @@
 #define NUM_THREADS_WARP (NUM_WARPS * WARP_SIZE)
 
 __global__ void matmulWarptileKernel(const float *A, const float *B, float *C, int N) {
-    __shared__ float As[BK_WARP][BM_WARP];
+    // Pad BM by 1 to avoid 16-way SMEM bank conflicts during
+    // transposed write (consecutive threads write to consecutive
+    // rows of As at stride BM; when BM is a multiple of 32 every
+    // thread in the same innerRowA group hits the same bank).
+    __shared__ float As[BK_WARP][BM_WARP + 1];
     __shared__ float Bs[BK_WARP][BN_WARP];
 
     const int warpId = threadIdx.x / WARP_SIZE;
@@ -151,7 +155,9 @@ template<int BM, int BN, int BK, int TM, int TN, int WARP_M, int WARP_N>
 __global__ void matmulWarptileKernelT(const float * __restrict__ A,
                                        const float * __restrict__ B,
                                        float *C, int N) {
-    __shared__ float As[BK][BM];
+    // Pad BM by 1 to avoid 16-way SMEM bank conflicts during
+    // transposed write (same issue as hardcoded baseline).
+    __shared__ float As[BK][BM + 1];
     __shared__ float Bs[BK][BN];
 
     constexpr int WARP_SIZE = 32;
@@ -287,19 +293,14 @@ static const CandidateW CANDIDATES_W[] = {
     {128, 128, 16, 16,  8, 64,  64},   // [ 1] bigger thread tile — same 4 warps
     {128, 128, 16,  8,  8, 64,  64},   // [ 2] square thread tile — 4 warps
     {128, 128,  8, 16,  8, 64,  64},   // [ 3] shallower BK — 8KB SMEM
-    {128, 128, 16, 16,  8, 64, 128},   // [ 4] wider warp — 2 warps, BN/2 per warp
-    {128, 128, 16, 16,  8,128,  64},   // [ 5] taller warp — 2 warps, BM/2 per warp
-    {256, 128, 16, 16,  8, 64,  64},   // [ 6] taller block — 8 warps, 24KB SMEM
-    {128, 256, 16, 16,  8, 64,  64},   // [ 7] wider block — 8 warps, 24KB SMEM
-    {128, 128,  8,  8,  4, 64,  64},   // [ 8] small thread tile (like default)
-    {128, 128,  8, 16,  4, 64,  64},   // [ 9] BK=8, TM=16, square-tiled M
-    {128, 128, 16,  8,  4, 32,  32},   // [10] small warp tile — 16 warps
-    {128, 128, 16,  8,  4, 32,  64},   // [11] small warp M × medium warp N
-    {128, 128, 16,  8,  4, 64,  32},   // [12] medium warp M × small warp N
-    {128, 128,  8,  4,  4, 64,  64},   // [13] tiny thread tile — 4 warps, 1024 thr
-    {256, 128, 16, 16,  8,128, 128},   // [14] big warp, tall block — 2 warps
-    {128, 128, 16,  8,  8, 64, 128},   // [15] wide warp, square thread — 2 warps
-    {128, 128, 16,  8,  8,128,  64},   // [16] tall warp, square thread — 2 warps
+    {256, 128, 16, 16,  8, 64,  64},   // [ 4] taller block — 8 warps, 24KB SMEM
+    {128, 256, 16, 16,  8, 64,  64},   // [ 5] wider block — 8 warps, 24KB SMEM
+    {128, 128,  8,  8,  4, 64,  64},   // [ 6] small thread tile (like default)
+    {128, 128,  8, 16,  4, 64,  64},   // [ 7] BK=8, TM=16, square-tiled M
+    {128, 128, 16,  8,  4, 32,  32},   // [ 8] small warp tile — 16 warps
+    {128, 128, 16,  8,  4, 32,  64},   // [ 9] small warp M × medium warp N
+    {128, 128, 16,  8,  4, 64,  32},   // [10] medium warp M × small warp N
+    {128, 128,  8,  4,  4, 64,  64},   // [11] tiny thread tile — 4 warps, 1024 thr
 };
 static const int NUM_CANDIDATES_W = sizeof(CANDIDATES_W) / sizeof(CANDIDATES_W[0]);
 
@@ -322,8 +323,6 @@ void MatmulWarptileAuto::launch(const float *d_A, const float *d_B, float *d_C,
     DISPATCH(128, 128, 16, 16,  8, 64,  64)
     DISPATCH(128, 128, 16,  8,  8, 64,  64)
     DISPATCH(128, 128,  8, 16,  8, 64,  64)
-    DISPATCH(128, 128, 16, 16,  8, 64, 128)
-    DISPATCH(128, 128, 16, 16,  8,128,  64)
     DISPATCH(256, 128, 16, 16,  8, 64,  64)
     DISPATCH(128, 256, 16, 16,  8, 64,  64)
     DISPATCH(128, 128,  8,  8,  4, 64,  64)
@@ -332,9 +331,6 @@ void MatmulWarptileAuto::launch(const float *d_A, const float *d_B, float *d_C,
     DISPATCH(128, 128, 16,  8,  4, 32,  64)
     DISPATCH(128, 128, 16,  8,  4, 64,  32)
     DISPATCH(128, 128,  8,  4,  4, 64,  64)
-    DISPATCH(256, 128, 16, 16,  8,128, 128)
-    DISPATCH(128, 128, 16,  8,  8, 64, 128)
-    DISPATCH(128, 128, 16,  8,  8,128,  64)
 
     #undef DISPATCH
 
