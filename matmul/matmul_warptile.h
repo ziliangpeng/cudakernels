@@ -32,4 +32,36 @@ public:
     ~MatmulWarptile() override;
 };
 
+// Warp Tiling with autotuning — sweeps (BM, BN, BK, TM, TN, WM, WN) candidates
+// the first time execute() is called and caches the best for subsequent launches.
+//
+// ~15 candidates explored across these axes:
+//   - block tile size  (BM, BN):  128..256, tall/wide included
+//   - K depth           (BK):     8 or 16
+//   - thread tile       (TM, TN): 2..16
+//   - warp tile         (WM, WN): 32..128
+//
+// Within-warp layout is fixed: WARP_THREAD_M=4, WARP_THREAD_N=8, so each warp
+// assigns 4 threads along M and 8 threads along N.  When WM/(4*TM) > 1 or
+// WN/(8*TN) > 1, each thread iterates over multiple TM×TN subtiles.
+//
+// Sweep policy: 2 warmup + 3 timed launches per candidate, median wins.
+class MatmulWarptileAuto : public MatmulKernel {
+private:
+    int N;
+    int blockDim;
+    int best_BM, best_BN, best_BK, best_TM, best_TN, best_WM, best_WN;
+    float best_time_ms;
+    bool tuned;
+
+    void tune(const float *d_A, const float *d_B, float *d_C);
+    void launch(const float *d_A, const float *d_B, float *d_C,
+                int BM, int BN, int BK, int TM, int TN, int WM, int WN);
+
+public:
+    MatmulWarptileAuto(int N, int blockDim);
+    void execute(const float *d_A, const float *d_B, float *d_C) override;
+    ~MatmulWarptileAuto() override;
+};
+
 #endif

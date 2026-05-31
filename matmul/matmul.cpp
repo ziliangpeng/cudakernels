@@ -37,12 +37,13 @@ const char* BENCHMARK_METHODS[] = {
     "vectorized",
     "vectorized_auto",
     "warptile",
+    "warptile_auto",
     "cublas",
     "wmma",
     "wmma_bf16",
     "cublas_bf16"
 };
-const int NUM_METHODS = 14;
+const int NUM_METHODS = 15;
 
 const int BENCHMARK_SIZES[] = {64, 128, 256, 512, 1024, 2048};
 const int NUM_SIZES = sizeof(BENCHMARK_SIZES) / sizeof(BENCHMARK_SIZES[0]);
@@ -170,6 +171,7 @@ void print_usage(const char *program_name) {
     printf("  vectorized:    float4 vectorized memory access\n");
     printf("  vectorized_auto: float4 vectorized + autotune (BM,BN,BK,TM,TN)\n");
     printf("  warptile:      warp-level tiling with register-level compute\n");
+    printf("  warptile_auto: warp-level tiling + autotune (BM,BN,BK,TM,TN,WM,WN)\n");
     printf("  cublas:        NVIDIA cuBLAS library (highly optimized)\n");
     printf("  wmma:          WMMA Tensor Core FP16 (Volta+ GPUs)\n");
     printf("  wmma_bf16:     WMMA Tensor Core BF16 (Ampere+ GPUs)\n");
@@ -548,6 +550,8 @@ void benchmark_all_methods(int blockDim, bool verify) {
                     kernel = new MatmulVectorizedAuto(N, blockDim);
                 } else if (strcmp(method, "warptile") == 0) {
                     kernel = new MatmulWarptile(N, blockDim);
+                } else if (strcmp(method, "warptile_auto") == 0) {
+                    kernel = new MatmulWarptileAuto(N, blockDim);
                 } else if (strcmp(method, "cublas") == 0) {
                     kernel = new MatmulCublas(N, blockDim);
                 } else if (strcmp(method, "wmma") == 0) {
@@ -698,6 +702,8 @@ void matmul_op(int N, int blockDim, bool verify, const char *method) {
         kernel = new MatmulVectorizedAuto(N, blockDim);
     } else if (strcmp(method, "warptile") == 0) {
         kernel = new MatmulWarptile(N, blockDim);
+    } else if (strcmp(method, "warptile_auto") == 0) {
+        kernel = new MatmulWarptileAuto(N, blockDim);
     } else if (strcmp(method, "cublas") == 0) {
         kernel = new MatmulCublas(N, blockDim);
     } else if (strcmp(method, "wmma") == 0) {
