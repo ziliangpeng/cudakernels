@@ -382,8 +382,8 @@ void MatmulWarptileAuto::tune(const float *d_A, const float *d_B, float *d_C) {
         int stn = WN / (8 * TN);
         if (stm < 1 || stn < 1) continue;
         if (WM % (4 * TM) != 0 || WN % (8 * TN) != 0) continue;
-        // SMEM
-        int smem_bytes = (BM * BK + BK * BN) * sizeof(float);
+        // SMEM — As is padded to BM+1 (bank-conflict avoidance)
+        int smem_bytes = (BK * (BM + 1) + BK * BN) * sizeof(float);
         if (smem_bytes > 48 * 1024) continue;
         // Divisibility for strided load
         if ((BM * BK) % threads_per_block != 0) continue;
