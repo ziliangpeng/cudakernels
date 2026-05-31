@@ -493,30 +493,45 @@ The vectorized autotune uses **the same structure as 2D blocktile** (non-transpo
 | `2d_blocktile_auto` (prev winner) | `(128, 128, 16, 16, 8)` | 33.7 T | 64.6% |
 | `vectorized_auto` vs `2d_blocktile_auto` | same config | **+1.1T (+3.3%)** | **+2.1pp** |
 
-### Full sweep table (N=4096, 3-run median per candidate)
+### Full sweep table (N=4096, single-launch median per candidate, post-fix re-sweep on exclusive pi1-h100-27)
 
 | # | BM | BN | BK | TM | TN | thr | SMEM | TFLOPS | notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| 0 | 128 | 128 | 8 | 8 | 8 | 256 | 8K | 22.87 | default |
-| **1 (BEST)** | **128** | **128** | **8** | **16** | **8** | **128** | **8K** | **32.43** | runner-up |
-| 2 | 128 | 128 | 8 | 8 | 16 | 128 | 8K | 23.21 | TM↔TN mirror (bad) |
-| 3 | 128 | 128 | 16 | 8 | 8 | 256 | 16K | 28.12 | |
-| **4 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16K** | **34.81** | **= winner** |
-| 5 | 128 | 128 | 16 | 8 | 16 | 128 | 16K | 24.34 | TM↔TN mirror at BK=16 |
-| 6 | 128 | 64 | 8 | 16 | 8 | 64 | 6K | 30.49 | asymmetric (tall) |
-| 7 | 64 | 128 | 8 | 8 | 16 | 128 | 6K | filtered (TN%4≠0) | TN=16 not div by 4 |
-| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12K | 28.94 | bigger block (tall) |
-| 9 | 128 | 256 | 8 | 8 | 16 | 256 | 12K | 21.91 | bigger block (wide) |
-| 10 | 64 | 64 | 8 | 8 | 8 | 64 | 4K | 27.83 | small block |
-| 11 | 64 | 64 | 16 | 8 | 8 | 64 | 8K | 29.61 | small + deeper BK |
-| 12 | 128 | 128 | 32 | 16 | 8 | 128 | 32K | 22.35 | BK wall |
-| 13 | 256 | 128 | 16 | 16 | 8 | 256 | 24K | 32.22 | bigger tall |
+| 0 | 128 | 128 | 8 | 8 | 8 | 256 | 8K | 22.68 | default |
+| 1 | 128 | 128 | 8 | 16 | 8 | 128 | 8K | 33.07 | runner-up @ BK=8 |
+| 2 | 128 | 128 | 8 | 8 | 16 | 128 | 8K | 23.08 | TM↔TN mirror (bad) |
+| 3 | 128 | 128 | 16 | 8 | 8 | 256 | 16K | 30.53 | |
+| **4 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16K** | **34.49** | **winner (avg 34.90)** |
+| 5 | 128 | 128 | 16 | 8 | 16 | 128 | 16K | 26.43 | TM↔TN mirror at BK=16 |
+| 6 | 128 | 64 | 8 | 16 | 8 | 64 | 6K | 30.38 | asymmetric (tall) |
+| 7 | 64 | 128 | 8 | 8 | 8 | 128 | 6K | 28.24 | asymmetric (wide), valid 128 thr |
+| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12K | 29.42 | bigger block (tall) |
+| 9 | 128 | 256 | 8 | 8 | 16 | 256 | 12K | 22.39 | bigger block (wide) |
+| 10 | 64 | 64 | 8 | 8 | 8 | 64 | 4K | 29.55 | small block |
+| 11 | 64 | 64 | 16 | 8 | 8 | 64 | 8K | 32.57 | small + deeper BK |
+| 12 | 128 | 128 | 32 | 16 | 8 | 128 | 32K | 22.75 | BK wall |
+| 13 | 256 | 128 | 16 | 16 | 8 | 256 | 24K | 33.34 | bigger tall |
 | 14 | 256 | 256 | 8 | 16 | 8 | 512 | — | SKIPPED | register spill |
-| 15 | 128 | 128 | 16 | 4 | 4 | 1024 | 16K | 26.39 | small thread tile |
+| 15 | 128 | 128 | 16 | 4 | 4 | 1024 | 16K | 26.59 | small thread tile |
 
 ### Reproducibility
 
-Two independent runs on pi1-h100-16 (idle node) gave 34.77T and 34.81T — ±0.04T (0.1% spread). The winner is stable.
+Two independent runs on exclusive `pi1-h100-27` (job 11723, full 8-GPU reservation, OverSubscribe=NO) gave 34.49T and 34.57T best — within 0.2%. The 100-iteration average is 34.90T / 34.89T — also tight. Earlier numbers (34.77–34.81T) came from `pi1-h100-16`, which we later discovered was a shared dev-partition node (OverSubscribe=OK, no GPU TRES on our salloc). Numbers above are from the truly-exclusive node post-`As[BM][BK+1]` bank-conflict fix.
+
+### Bank-conflict padding (Gemini PR #4 review)
+
+Gemini's PR #4 review caught that the inner-loop SMEM access `As[threadRow * TM + i][dotIdx]` causes a 2-way bank conflict when `TM * BK` is a multiple of 32 (e.g. `BK=16, TM=16` → stride 256 = 8×32). The fix is a 1-element inner-dimension pad: `__shared__ float As[BM][BK + 1]`. Inner stride becomes `TM * (BK+1) = 17 * 16 = 272`, not divisible by 32 → conflict eliminated. Cost: 512 bytes extra SMEM for BM=128.
+
+Effect by candidate (delta vs pre-fix on shared `pi1-h100-16`):
+
+| Candidate | Pre-fix (shared -16) | Post-fix (exclusive -27) | Δ |
+|---|---|---|---|
+| [4] WINNER (128,128,**16**,16,8) | 34.81 | 34.49 | flat (within noise) |
+| [1] (128,128,**8**,16,8) | 32.43 | 33.07 | +0.6 |
+| [11] (64,64,**16**,8,8) | 29.61 | **32.57** | **+3.0** |
+| [13] (256,128,**16**,16,8) | 32.22 | 33.34 | +1.1 |
+
+Several BK=16 candidates jump by 1-3T. The winner [4] is flat — it's already register/compute-bound, not SMEM-port-bound, so removing the conflict doesn't help. The ranking is unchanged (same winner config), so this is a real but modest defensive cleanup, not a peak-perf improvement. Worth keeping because (a) it's free, (b) it would matter if a future kernel variant hits the bank-conflict scenario.
 
 ### Key finding
 
