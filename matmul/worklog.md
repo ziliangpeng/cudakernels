@@ -238,10 +238,57 @@ The critical line is `As[threadRow * TM + resIdx][dotIdx]` — as `resIdx` varie
 | SMEM tiling | 9.0 T | 17.2% | — |
 | **1D blocktile** | **17.6 T** | **33.7%** | **+96%** |
 
+### Recursive tiling — "block tile" is literally a tile of a tile
+
+The single most important conceptual shift at this step:
+
+> **A "block tile" is a tile of a tile.** First we tile the global matrix into block tiles that fit in SMEM. Then we tile each block tile into thread tiles that fit in registers. Each level of tiling unlocks reuse at the next level of the memory hierarchy.
+
+```
+Matrix C (4096 × 4096)
+  ↓ divided into block tiles (one block per tile)
+Block tile (64 × 64)               ← SMEM, shared by all threads in the block
+  ↓ divided into thread tiles (one thread per tile)
+Thread tile (8 × 1 in 1D blocktile) ← Registers, private to one thread
+  ↓ each madd touches
+Single elements                     ← register-to-register multiply-add
+```
+
+| Tile level | Data lives in | Who shares it | What it eliminates |
+|---|---|---|---|
+| Block tile (BM × BN) | SMEM | All threads in the block | Cross-thread HBM redundancy |
+| Thread tile (TM × 1) | Register | One thread | Repeated SMEM→register reloads inside a thread |
+
+Without the second level of tiling, every madd inside a thread requires a fresh SMEM read for both A and B. The SMEM bandwidth is fine, but the **SMEM ports** become the bottleneck — there are only so many concurrent SMEM accesses per cycle. Once you can't issue enough SMEM reads to feed the FP32 cores, performance plateaus.
+
+Thread-level tiling fixes this by loading a small slice once into registers and reusing it across multiple madds. Each SMEM read now feeds TM=8 madds instead of 1, so the SMEM port traffic drops 8× while compute throughput stays the same.
+
+### "1D" vs "2D" thread tile
+
+- **1D blocktile**: thread tile is TM × 1 (one column slice). One A column held in registers, B element streamed through `tmpB`. 1 SMEM B read → 8 madds.
+- **2D blocktile** (next step): thread tile is TM × TN (a small square). Both A column and B row held in registers, mini-square accumulated. 1 SMEM A read + 1 SMEM B read → TM×TN = 64 madds.
+
+The 2D version reuses both A and B at the register level, not just B. That's why it gives another big jump.
+
+### Why not load the whole tile into registers?
+
+A block tile is 64×8 = 512 floats = 2KB. With 512 threads/block and 256KB register file per SM (= 64K 32-bit registers), each thread averages ~128 registers. A single thread cannot hold an entire 512-float tile.
+
+More importantly, registers are **per-thread private**. Loading the whole tile into every thread's registers would be massively redundant — each thread only computes its own 8 output elements and doesn't need the rest of the tile's data in its own registers. The right design is: SMEM holds the tile once (shared), each thread pulls in only its own thread-tile slice.
+
 ### What we learned
 
-> **SMEM tiling reuses data at the L1/SMEM level (block-level reuse). 1D blocktile adds reuse at the register level (thread-level reuse).**
+> **SMEM tiling reuses data at the L1/SMEM level (block-level reuse).
+> 1D blocktile adds reuse at the register level (thread-level reuse).
+> A "block tile" is a tile of a tile — recursive tiling matches recursive levels of the memory hierarchy.**
 
-The 96% jump (from 5.7T to 9.0T was block-level SMEM; from 9.0T to 17.6T was register-level thread reuse) comes from making each SMEM read do 8× more work. The same B element is read once from SMEM, held in a register, and multiplied against 8 different A values — each producing a different partial sum. This amplifies the effective SMEM bandwidth by 8× without changing the tile loading pattern at all.
+The 96% jump comes from making each SMEM read do 8× more work. The same B element is read once from SMEM, held in a register, and multiplied against 8 different A values — each producing a different partial sum. This amplifies the effective SMEM bandwidth by 8× without changing the HBM→SMEM tile loading pattern at all.
 
-The memory hierarchy insight: HBM → SMEM/L1 fixed the *cross-thread* waste; Register reuse fixed the *within-thread* waste. Both layers are needed to approach the hardware limit.
+The general principle that every subsequent step inherits:
+
+```
+HBM tile  →  SMEM tile  →  Register tile  →  Tensor Core fragment
+(global)    (block)         (thread)         (warp / wgmma)
+```
+
+Each level of tiling unlocks reuse at the next level of the hierarchy. CUTLASS systematizes this: every tile size is a template parameter. WGMMA / Tensor Core kernels add one more layer (the fragment tile fed to `wgmma.mma_async`). Same idea, more layers — every extra tile level absorbs another bandwidth bottleneck.
