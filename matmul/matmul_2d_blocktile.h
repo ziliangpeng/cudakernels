@@ -35,7 +35,7 @@ public:
 // 2D Block Tiling with autotuning — sweeps (BM, BN, BK, TM, TN) candidates the
 // first time execute() is called and caches the best for subsequent launches.
 //
-// 11 candidates explored across three axes:
+// 19 candidates explored across three axes:
 //   - block tile size (BM, BN): 64..256, including asymmetric pairs
 //   - K depth         (BK):    8 or 16
 //   - thread tile     (TM,TN): 4..16, asymmetric allowed

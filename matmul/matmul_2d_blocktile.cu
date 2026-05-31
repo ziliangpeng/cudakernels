@@ -140,7 +140,7 @@ Matmul2DBlocktile::~Matmul2DBlocktile() {}
 // Autotuning version — Matmul2DBlocktileAuto
 // ============================================================================
 //
-// 11-candidate sweep across (BM, BN, BK, TM, TN). Each candidate satisfies:
+// 19-candidate sweep across (BM, BN, BK, TM, TN). Each candidate satisfies:
 //   - NUM_THREADS = (BM/TM) * (BN/TN) <= 1024 (CUDA hard limit)
 //   - NUM_THREADS divides BM*BK (A tile load element count)
 //   - NUM_THREADS divides BK*BN (B tile load element count)
@@ -233,9 +233,24 @@ void Matmul2DBlocktileAuto::launch(const float *d_A, const float *d_B, float *d_
 }
 
 void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C) {
+    // RAII guard for the cudaEvent_t pair so we don't leak the events if
+    // launch() throws (e.g. unsupported config or runtime error from a kernel
+    // dispatch that didn't make it into the DISPATCH table). The guard creates
+    // both events in its constructor and destroys them in its destructor — the
+    // events are usable for the rest of this function via `start` / `stop`.
+    struct EventGuard {
+        cudaEvent_t &s, &e;
+        EventGuard(cudaEvent_t &start_, cudaEvent_t &stop_) : s(start_), e(stop_) {
+            cudaEventCreate(&s);
+            cudaEventCreate(&e);
+        }
+        ~EventGuard() {
+            cudaEventDestroy(s);
+            cudaEventDestroy(e);
+        }
+    };
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    EventGuard guard(start, stop);
 
     int best_idx = -1;
     float best_ms = 1e30f;
@@ -329,8 +344,7 @@ void Matmul2DBlocktileAuto::tune(const float *d_A, const float *d_B, float *d_C)
         }
     }
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    // Events are automatically destroyed by EventGuard when this function returns.
 
     if (best_idx < 0) {
         // All candidates skipped (e.g. odd N). Fall back to default.
