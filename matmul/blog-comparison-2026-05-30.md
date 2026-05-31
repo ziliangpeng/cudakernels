@@ -27,6 +27,7 @@ Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autot
 | 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.5% (16.9 T) | 33.7% (17.6 T) | 36.5% (8.5 T) | −2.8pp ≈ |
 | **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | — | **36.9% (19.3 T)** | 36.5% (8.5 T) | **+0.4pp** ✅ |
 | 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (21.6 T) | 42.9% (22.4 T) | 68.7% (16.0 T) | **−25.8pp** ⚠️ |
+| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | — | **64.6% (33.7 T)** | 68.7% (16.0 T) | **−4.1pp** ✅ |
 | Vectorized | [link](matmul_vectorized.cu) | 65.1% (32.8 T) | 63.0% (32.9 T) | 78.4% (18.2 T) | −15.4pp |
 | Warptile | [link](matmul_warptile.cu) | 56.3% (28.4 T) | 54.2% (28.3 T) | **93.7%** (21.8 T) | **−39.5pp** ⚠️⚠️ |
 | Autotuning | — | — | — | 84.8% (19.7 T) | — |
@@ -36,6 +37,8 @@ Each `link` in the Src column points to the corresponding `matmul_<step>.cu` fil
 **Observation**: coalesced + SMEM degrade slightly at 4K (memory-bound, working set exceeds L2). 1D/2D blocktile hold steady. Vectorized + warptile nearly flat (occupancy/register-bound). Our % vs Simon are essentially identical at 2K and 4K for every kernel — the gap is structural (tile sizes, block dim), not scale-dependent.
 
 **Autotuning update (2026-05-30)**: 1D blocktile autotuned across 7 legal candidates (kernel constraint: BM = BN = BK·TM). Best config = `BM=BN=64, BK=4, TM=16` (256 threads, 16 outputs per thread), 19.26 TFLOPS @ N=4096 — **+9% over hardcoded baseline (17.6 → 19.3)**, just edging Simon's autotuned 1D blocktile on A100 (36.5% → 36.9%). The winning config is *not* siboehm's recommended `(64, 64, 8, 8)` — H100 prefers smaller BK + larger TM (more register reuse per thread). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 4 "Autotune result" section for full details.
+
+**2D blocktile autotune (2026-05-30, updated)**: 2D blocktile autotuned across 19 candidates (initial 11 + 4 expansion + 4 v3 after the SMEM math fix). Best config = `BM=BN=128, BK=16, TM=16, TN=8` (128 threads, 8×16 thread tile), **33.7 TFLOPS @ N=4096 — +52% over the hardcoded baseline (22.2 → 33.7)**. We now nearly match Simon's autotuned A100 2D blocktile (64.6% vs 68.7%) and **beat Simon's autotuned warptile when run on H100** (64.6% vs 60.9%). Three lessons: (a) BK=16 is a sweet spot, not a "deeper is better" ladder; (b) **TM and TN are NOT mirror-symmetric** — `(TM=16, TN=8)` runs 30% faster than the swapped `(TM=8, TN=16)`, because the compiler hoists `regA[i]` and longer TN causes register-allocation pressure; (c) once SM occupancy saturates, bigger blocks just add SMEM bloat without buying parallelism. Gemini Code Assist caught two real bugs in the autotuner's validity check during PR review (SMEM 2× over-count, and missing `NUM_THREADS % BK == 0` divisibility leading to silent OOB SMEM writes for BK=24 candidates — fixed in commit 38f8709). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 5 "Autotune result" for full details.
 
 Shared infra: [`matmul.cpp`](matmul.cpp) (benchmark harness), [`matmul_kernel.h`](matmul_kernel.h) (base class), [`matrix_init.{h,cu}`](matrix_init.cu) (CPU reference).
 

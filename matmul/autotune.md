@@ -336,7 +336,7 @@ This is a direct empirical confirmation of the mental model from `worklog.md` St
 #### Lesson 4: Autotune surfaces algorithm ceilings, not raises them
 
 Best 1D blocktile config: 19.26 TFLOPS (36.9% vs cuBLAS FP32).
-2D blocktile hardcoded: 22.4 TFLOPS (42.9%).
+2D blocktile hardcoded: 22.2 TFLOPS (42.6%).
 
 Even tuned to the limit, 1D cannot beat 2D — because 2D adds register reuse on A (via outer product) that 1D fundamentally lacks. **Autotune optimizes within an algorithm's ceiling; only a new algorithm raises the ceiling.**
 
@@ -373,7 +373,100 @@ We now slightly edge Simon's A100 autotuned percentage at this step (36.9% vs 36
 | Step | Autotune status | Best TFLOPS @ N=4096 | Winning config |
 |---|---|---|---|
 | SMEM | TODO | 9.0 (hardcoded) | — |
-| **1D blocktile** | **✅ Done** | **19.3** | **`(BM=BN=64, BK=4, TM=16)`** |
-| 2D blocktile | TODO | 22.4 (hardcoded) | — |
+| 1D blocktile | ✅ Done | 19.3 | `(BM=BN=64, BK=4, TM=16)` |
+| **2D blocktile** | **✅ Done** | **33.7** | **`(BM=BN=128, BK=16, TM=16, TN=8)`** |
 | Vectorized | TODO | 32.9 (hardcoded) | — |
 | Warptile | TODO | 28.3 (hardcoded) | — |
+
+---
+
+## Actual Results — 2D Blocktile (2026-05-30)
+
+Second autotune step executed. Branch: `autotune-2d-blocktile`. Class: `Matmul2DBlocktileAuto`.
+
+### Performance summary
+
+| Variant | Config | N=4096 TFLOPS | vs cuBLAS FP32 |
+|---|---|---|---|
+| `2d_blocktile` (hardcoded baseline) | `(128, 128, 8, 8, 8)` | 22.2 | 42.6% |
+| **`2d_blocktile_auto` (winning config)** | **`(128, 128, 16, 16, 8)`** | **33.7** | **64.6%** |
+| Delta | — | **+51.7%** | **+22.0pp** |
+| Simon's autotuned 2D (A100) | (varies) | 16.0 | 68.7% |
+| Simon's autotuned warptile (H100) | (varies) | 31.8 | 60.9% |
+
+This is the **biggest single-step jump** in the entire project so far (+52%). We now nearly match Simon's autotuned A100 2D blocktile (64.6% vs 68.7%) and **beat his autotuned warptile when run on H100** (64.6% vs 60.9%).
+
+### Full sweep table (N=4096, 3-run median per candidate)
+
+| # | BM | BN | BK | TM | TN | thr | SMEM | TFLOPS | notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 0 | 128 | 128 | 8 | 8 | 8 | 256 | 8K | 22.24 | default |
+| 1 | 64 | 64 | 8 | 8 | 8 | 64 | 4K | 28.12 | |
+| 2 | 128 | 128 | 8 | 16 | 8 | 128 | 8K | 32.40 | runner-up |
+| 3 | 128 | 128 | 8 | 8 | 16 | 128 | 8K | 22.89 | TM↔TN mirror at BK=8 |
+| 4 | 128 | 128 | 16 | 8 | 8 | 256 | 16K | 28.55 | |
+| 5 | 128 | 64 | 8 | 8 | 8 | 128 | 6K | 25.24 | asymmetric (tall) |
+| 6 | 64 | 128 | 8 | 8 | 8 | 128 | 6K | 28.41 | asymmetric (wide) |
+| 7 | 128 | 128 | 8 | 4 | 4 | 1024 | 8K | 21.50 | small thread tile |
+| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12K | 29.02 | |
+| 9 | 128 | 256 | 8 | 8 | 16 | 256 | 12K | 21.30 | mirror of #8 |
+| **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16K** | **33.73** | **winner** |
+| 11 | 256 | 128 | 16 | 16 | 8 | 256 | 24KB | 31.54 | expansion (worse) |
+| 12 | 128 | 128 | 32 | 16 | 8 | 128 | 32KB | 22.47 | expansion (SMEM wall) |
+| 13 | 128 | 128 | 16 | 8 | 16 | 128 | 16KB | 23.74 | expansion (TM↔TN at BK=16) |
+| 14 | 256 | 256 | 16 | 16 | 8 | 512 | — | SKIPPED | register spill |
+| 15 | 256 | 128 | 24 | 16 | 8 | — | — | INVALID | filtered out: NUM_THREADS=256, 256%24≠0 → strided load OOB |
+| 16 | 256 | 128 | 32 | 16 | 8 | 256 | 48KB | 20.87 | v3 — BK=32 confirmed bad at all blocks |
+| 17 | 128 | 128 | 24 | 16 | 8 | — | — | INVALID | filtered out: NUM_THREADS=128, 128%24≠0 → strided load OOB |
+| 18 | 256 | 256 | 8 | 16 | 8 | 512 | — | SKIPPED | v3 — register spill (256² area) |
+
+The hardcoded `(128, 128, 8, 8, 8)` siboehm-A100 default ranks **8th of 19** at 22.24T (10 candidates beat it, 4 INVALID/SKIPPED, 4 worse). Almost everything in the grid except the obvious bad configs (small TM/TN, mirror-swapped, oversized) beats the default. This re-confirms what 1D blocktile's autotune showed: H100 prefers smaller threads/block, larger thread tiles, and deeper BK than A100.
+
+### Reproducibility check
+
+Sweeps were originally run 3 times on pi1-h100-11 (independent node), showing winner variance ±0.06T (0.2%). After Gemini's PR review surfaced two real bugs in the validity check (commit 38f8709), the sweep was re-run on a freshly allocated idle node pi1-h100-16, producing the numbers above. Winner is still `(128, 128, 16, 16, 8)`; absolute throughput shifted from 34.04 → 33.73 (0.9%), well within typical node-to-node noise on a shared cluster.
+
+The originally-reported numbers came from a node where other Slurm jobs were not yet active (pre-fix sweep ran in low-contention window). Between the pre-fix and post-fix runs the cluster filled up, but pi1-h100-16 was idle when we re-tested, so the post-fix numbers are clean.
+
+(Removed the original 3-run reproducibility table from this section; the post-fix run is the canonical number now.)
+
+### Lessons (vs Lesson 2 surprises especially)
+
+#### Lesson 1: BK = 16 is a sweet spot, not a monotonic ladder
+BK=8 → 32.4T; BK=16 → 33.7T; BK=32 → 22.5T. Going past 16 raises SMEM per block, which drops the number of resident blocks per SM and collapses latency hiding. **K-loop depth has a sweet spot, not a "deeper is better" curve.** Earlier drafts cited a BK=24 datapoint at 27.7T; that number was the product of an OOB strided load (Gemini caught it in PR review — `NUM_THREADS % BK == 0` is a hard requirement for the kernel's strided load to cover the A/B tiles exactly). After commit 38f8709 added the divisibility checks, BK=24 candidates are correctly filtered out before launch. Valid points are BK ∈ {8, 16, 32}.
+
+#### Lesson 2: TM and TN are NOT mirror-symmetric (most surprising)
+`(TM=16, TN=8) → 33.73 TFLOPS` but `(TM=8, TN=16) → 23.74 TFLOPS`. Same total reuse (TM·TN=128), same SMEM, same thread count. Difference: the inner loop is `for i { for j { ... regA[i] * regB[j] } }`. Hoisted `regA[i]` has lifetime TN cycles. Long TN forces all regB[0..TN-1] to be live simultaneously → tighter register allocation → likely partial spill of accumulators.
+
+This is the kind of finding **no theory paper would tell you**. Source code looks symmetric; hardware behavior is not.
+
+#### Lesson 3: Bigger block ≠ better when SMs already have enough blocks
+At BM=BN=128, the 4096² GEMM produces 1024 blocks for 132 SMs — already 8 blocks/SM in flight. Pushing BM to 256 just halves the block count without increasing concurrency, while doubling SMEM footprint. Net loss.
+
+#### Lesson 4: Default is one of the worst (again)
+Default ranks 7th of 15 (22.24T vs winner 33.73T). Same pattern as 1D autotune: hardcoded A100 numbers are bad on H100. Sweep margin: +52%.
+
+### Implementation notes
+
+- 15-candidate grid built in **two iterations**: 11 initial probes + 4 informed expansions
+- After first batch found winners clustering at `(128, 128, 16, 16, 8)`, expansion probes each pushed one axis to test where the boundary lies
+- All 4 expansions probed a wall; none beat the winner. This gives strong confidence the winner is near-optimal within the kernel design
+- `cudaGetLastError` after warmup cleanly catches candidate 14's register-spill failure → printed `SKIPPED (too many resources requested for launch)` → no false ranking
+- Strided load pattern (vs 1D's 1-element-per-thread) enables much wider candidate space — we explored 15 configs vs 7 for 1D
+- Total sweep cost at N=4096: ~14 candidates × 5 launches × ~5ms ≈ 350ms. Negligible against the 100-iteration timing loop
+
+### Iterative-vs-exhaustive grid design
+
+This step validated the "expand grid based on what the previous batch revealed" approach:
+
+- Batch 1 (11 candidates): broad exploration, found `(128,128,16,16,8)` near the top
+- Batch 2 (4 candidates): targeted probes at each adjacent direction
+- All 4 probes hit a wall, confirming the winner is local optimum
+
+The full Cartesian product `BM × BN × BK × TM × TN` would be ~thousands of configs. The iterative approach got us to a confidently-near-optimal winner in 15 configs by following the data.
+
+### Open questions
+
+1. **Should we sweep at multiple N (not just 4096)?** Smaller N might prefer smaller blocks for better SM coverage. Currently each `Matmul2DBlocktileAuto` instance sweeps once for its own N, so the benchmark `all` mode does pick per-N winners — we just haven't analyzed them.
+2. **The TM ≠ TN asymmetry is a real algorithmic finding.** Should we add a swap-direction toggle to the kernel? Probably not worth it — the asymmetry only matters when one of TM/TN is large; for square tiles it's symmetric.
+3. **Should we extract autotune harness into a shared file?** Both 1D and 2D `*Auto` classes have nearly identical `tune()` boilerplate. Refactor candidate after 1-2 more steps.

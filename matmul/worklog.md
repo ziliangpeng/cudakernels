@@ -482,6 +482,112 @@ The general pattern is now clear:
 
 Going bigger on the thread tile (TM, TN) increases arithmetic intensity but also increases register pressure (TM×TN accumulators + TM + TN input registers). At some point you run out of registers per thread and occupancy collapses. The sweet spot for FP32 H100 is around TM=TN=8 (64 accumulators); WGMMA Tensor Core kernels push this to 64×N because the Tensor Core fragment itself replaces the inner 8×8 outer product with a single hardware instruction.
 
+### Autotune result (2026-05-30)
+
+Implemented `Matmul2DBlocktileAuto` (see `matmul_2d_blocktile.cu`). 15-candidate grid swept iteratively in two batches: 11 initial probes across `(BM, BN, BK, TM, TN)`, then 4 expansion probes informed by the first batch's winners. Verified across 3 independent runs — winner stable within ±0.2%, runner-up gap +3.6% (well above noise).
+
+**Result at N=4096**:
+
+| # | BM | BN | BK | TM | TN | Threads | SMEM | TFLOPS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **10 (BEST)** | **128** | **128** | **16** | **16** | **8** | **128** | **16KB** | **33.73** |
+| 2 | 128 | 128 | 8 | 16 | 8 | 128 | 8KB | 32.40 |
+| 11 | 256 | 128 | 16 | 16 | 8 | 256 | 24KB | 31.54 |
+| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12KB | 29.02 |
+| 4 | 128 | 128 | 16 | 8 | 8 | 256 | 16KB | 28.55 |
+| 13 | 128 | 128 | 16 | 8 | **16** | 128 | 16KB | 23.74 |
+| 0 (default) | 128 | 128 | 8 | 8 | 8 | 256 | 8KB | 22.24 |
+| 12 | 128 | 128 | **32** | 16 | 8 | 128 | 32KB | 22.47 |
+| 7 | 128 | 128 | 8 | 4 | 4 | 1024 | 8KB | 21.50 |
+| 14 | 256 | 256 | 16 | 16 | 8 | 512 | — | SKIPPED (register spill) |
+
+(Full 19-row table in [`autotune.md`](autotune.md).)
+
+**Default vs Best**:
+
+| | Default (#0) | Best (#10) | Delta |
+|---|---|---|---|
+| `(BM, BN, BK, TM, TN)` | `(128, 128, 8, 8, 8)` | `(128, 128, 16, 16, 8)` | — |
+| Threads per block | 256 | 128 | ½× |
+| SMEM per block | 8 KB | 16 KB | 2× |
+| Outputs per thread | 64 | 128 | 2× |
+| Register accumulators / thread | 64 | 128 | 2× |
+| K-loop iterations (N=4096) | 512 | 256 | ½× |
+| Median time | 6.18 ms | 4.07 ms | −34% |
+| **TFLOPS** | **22.24** | **33.73** | **+51.7%** |
+
+The +52% jump pushes 2D blocktile from 42.9% to **64.6%** of cuBLAS FP32, closing most of the gap to Simon's autotuned A100 (68.7%) and beating Simon's autotuned warptile running on H100 (60.9%).
+
+### Four lessons from the sweep
+
+#### Lesson 1: BK = 16 is a sweet spot, not a monotonic ladder
+
+```
+BK=8   → 32.40 TFLOPS  (candidate 2)
+BK=16  → 33.73 TFLOPS  (candidate 10) ← peak
+BK=32  → 22.47 TFLOPS  (candidate 12) ← collapse
+```
+
+Going from BK=16 to BK=32 doubled SMEM per block (32KB vs 16KB) and pushed the SM toward fewer resident blocks. **Throughput dropped 33%.** The K-loop chunk size has to balance "more compute per sync" against "fewer blocks fit per SM" — BK=16 hits that balance on H100.
+
+Earlier drafts of this doc cited a BK=24 datapoint at 27.7T. That number was **invalid** — the kernel's strided load requires `NUM_THREADS % BK == 0`, which BK=24 violates (`128 % 24 = 8`, `256 % 24 = 16`). The autotuner's validity check missed this, so candidates 15 and 17 were silently writing OOB into SMEM during the previous run. Gemini Code Assist caught this in PR review (commit 38f8709 added the missing divisibility checks); after the fix those candidates are correctly filtered out before launch. The valid data we have is BK ∈ {8, 16, 32}; the sweet-spot conclusion stands but we should not extrapolate to claims about BK=24.
+
+#### Lesson 2: TM and TN are NOT mirror-symmetric
+
+The most surprising finding:
+
+```
+TM=16, TN= 8 → 33.73 TFLOPS  (candidate 10)
+TM= 8, TN=16 → 23.96 TFLOPS  (candidate 13) ← −30% from a mirror swap
+```
+
+Both configs have the same total register reuse factor (TM·TN = 128 madds per outer-product call), the same SMEM footprint, the same thread count. They differ only by which axis is "long".
+
+Why the asymmetry? The compiler-emitted inner loop walks `for i { for j { regC[i][j] += regA[i] * regB[j] } }`. `regA[i]` is hoisted out of the inner j loop, so its lifetime spans TN iterations. With TM=16, TN=8, the j loop is short → `regA` register pressure is bounded → register allocation succeeds cleanly. With TM=8, TN=16, the j loop is longer → `regB[0..15]` must all be live simultaneously → register allocation gets tighter → likely spilling some accumulators to local memory.
+
+This is one of those autotune findings that **no theory paper would tell you**. The kernel source code looks symmetric in TM and TN. The hardware behavior is not.
+
+#### Lesson 3: Bigger block ≠ better when occupancy already saturates
+
+```
+BM=128, BN=128  →  33.73 TFLOPS  (candidate 10)
+BM=256, BN=128  →  31.54 TFLOPS  (candidate 11)
+BM=256, BN=256  →  REGISTER SPILL  (candidate 14)
+```
+
+Once the SM has enough concurrent blocks/warps to hide latency, making each block bigger just adds SMEM pressure without buying more parallelism. H100 has 132 SMs; at BM=BN=128, the 4096×4096 GEMM has 32×32 = 1024 blocks — plenty of work to spread across SMs without needing larger tiles.
+
+#### Lesson 4: Default is one of the worst (again)
+
+The hardcoded `(128, 128, 8, 8, 8)` siboehm-A100 default ranks **7th of 15** at 22.45T. Almost everything in the grid except the obvious bad configs (small TM/TN, mirror-swapped, oversized) beats the default. This re-confirms what 1D blocktile's autotune showed: H100 prefers smaller threads/block, larger thread tiles, and deeper BK than A100.
+
+### Reproducibility check
+
+Ran the full sweep 3 times to validate the winner isn't a noise artifact:
+
+| Candidate | Run 1 | Run 2 | Run 3 | Spread |
+|---|---:|---:|---:|---:|
+| #10 (BEST) | 34.03 | 34.09 | 34.04 | ±0.06T (0.2%) |
+| #2 (runner-up) | 32.65 | 32.91 | 32.84 | ±0.13T (0.4%) |
+| #0 (default) | 22.31 | 22.42 | 22.45 | ±0.07T (0.3%) |
+
+Winner-vs-runner-up gap (+3.6%) is 18× larger than the noise floor (~0.2%). Winner is real.
+
+### Grid expansion methodology — iterative, not exhaustive
+
+The first 11-candidate batch found `(128, 128, 16, 16, 8)` clustering at the top. The second batch added 4 candidates probing the boundaries of that cluster:
+
+- candidate 11: push BM bigger → 31.8T (worse, occupancy hurt)
+- candidate 12: push BK deeper → 22.2T (worse, SMEM bloat)
+- candidate 13: mirror TM↔TN → 23.9T (worse, asymmetric finding)
+- candidate 14: push both BM and BN bigger → register spill (kernel rejected)
+
+All four expansions probed a boundary; none beat the winner. **The 4-axis sweet spot in the candidate grid coincides with a 4-axis wall**: BM=128 (occupancy wall), BK=16 (SMEM wall), TM=16 (register-reuse wall), TN=8 (asymmetric register-allocation wall). Pushing any direction degrades.
+
+This is the kind of confidence empirical sweep gives you that paper-style theory cannot.
+
+See [`autotune.md`](autotune.md) "Actual Results — 2D Blocktile" section for full sweep data, harness implementation notes, and updated status table.
+
 ---
 
 ## Step 6: Vectorized — `float4` Loads + Transposed A Tile

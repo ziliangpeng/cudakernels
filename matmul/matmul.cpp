@@ -33,6 +33,7 @@ const char* BENCHMARK_METHODS[] = {
     "1d_blocktile",
     "1d_blocktile_auto",
     "2d_blocktile",
+    "2d_blocktile_auto",
     "vectorized",
     "warptile",
     "cublas",
@@ -40,7 +41,7 @@ const char* BENCHMARK_METHODS[] = {
     "wmma_bf16",
     "cublas_bf16"
 };
-const int NUM_METHODS = 12;
+const int NUM_METHODS = 13;
 
 const int BENCHMARK_SIZES[] = {64, 128, 256, 512, 1024, 2048};
 const int NUM_SIZES = sizeof(BENCHMARK_SIZES) / sizeof(BENCHMARK_SIZES[0]);
@@ -537,6 +538,8 @@ void benchmark_all_methods(int blockDim, bool verify) {
                     kernel = new Matmul1DBlocktileAuto(N, blockDim);
                 } else if (strcmp(method, "2d_blocktile") == 0) {
                     kernel = new Matmul2DBlocktile(N, blockDim);
+                } else if (strcmp(method, "2d_blocktile_auto") == 0) {
+                    kernel = new Matmul2DBlocktileAuto(N, blockDim);
                 } else if (strcmp(method, "vectorized") == 0) {
                     kernel = new MatmulVectorized(N, blockDim);
                 } else if (strcmp(method, "warptile") == 0) {
@@ -683,6 +686,8 @@ void matmul_op(int N, int blockDim, bool verify, const char *method) {
         kernel = new Matmul1DBlocktileAuto(N, blockDim);
     } else if (strcmp(method, "2d_blocktile") == 0) {
         kernel = new Matmul2DBlocktile(N, blockDim);
+    } else if (strcmp(method, "2d_blocktile_auto") == 0) {
+        kernel = new Matmul2DBlocktileAuto(N, blockDim);
     } else if (strcmp(method, "vectorized") == 0) {
         kernel = new MatmulVectorized(N, blockDim);
     } else if (strcmp(method, "warptile") == 0) {
