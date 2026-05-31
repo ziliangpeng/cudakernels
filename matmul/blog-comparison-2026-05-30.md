@@ -21,16 +21,16 @@ Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autot
 
 | Step | Src | Ours 2K | Ours 4K | Simon 4K | Gap (vs Simon 4K) |
 |---|---|---|---|---|---|
-| Naive | naive | — | — | 1.3% (0.3 T) | — |
-| Coalesced | coalesced | 13.1% (6.6 T) | 10.9% (5.7 T) | 8.5% (2.0 T) | +2.4pp ✅ |
-| SMEM tiling | smem | 18.3% (9.2 T) | 17.2% (9.0 T) | 12.8% (3.0 T) | +4.4pp ✅ |
-| 1D blocktile | 1d_blocktile | 33.5% (16.9 T) | 33.7% (17.6 T) | 36.5% (8.5 T) | −2.8pp ≈ |
-| 2D blocktile | 2d_blocktile | 42.9% (21.6 T) | 42.9% (22.4 T) | 68.7% (16.0 T) | **−25.8pp** ⚠️ |
-| Vectorized | vectorized | 65.1% (32.8 T) | 63.0% (32.9 T) | 78.4% (18.2 T) | −15.4pp |
-| Warptile | warptile | 56.3% (28.4 T) | 54.2% (28.3 T) | **93.7%** (21.8 T) | **−39.5pp** ⚠️⚠️ |
+| Naive | [link](matmul_naive.cu) | — | — | 1.3% (0.3 T) | — |
+| Coalesced | [link](matmul_coalesced.cu) | 13.1% (6.6 T) | 10.9% (5.7 T) | 8.5% (2.0 T) | +2.4pp ✅ |
+| SMEM tiling | [link](matmul_smem.cu) | 18.3% (9.2 T) | 17.2% (9.0 T) | 12.8% (3.0 T) | +4.4pp ✅ |
+| 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.5% (16.9 T) | 33.7% (17.6 T) | 36.5% (8.5 T) | −2.8pp ≈ |
+| 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (21.6 T) | 42.9% (22.4 T) | 68.7% (16.0 T) | **−25.8pp** ⚠️ |
+| Vectorized | [link](matmul_vectorized.cu) | 65.1% (32.8 T) | 63.0% (32.9 T) | 78.4% (18.2 T) | −15.4pp |
+| Warptile | [link](matmul_warptile.cu) | 56.3% (28.4 T) | 54.2% (28.3 T) | **93.7%** (21.8 T) | **−39.5pp** ⚠️⚠️ |
 | Autotuning | — | — | — | 84.8% (19.7 T) | — |
 
-Each Src entry links to `matmul_<name>.cu` in this directory.
+Each `link` in the Src column points to the corresponding `matmul_<step>.cu` file in this directory.
 
 **Observation**: coalesced + SMEM degrade slightly at 4K (memory-bound, working set exceeds L2). 1D/2D blocktile hold steady. Vectorized + warptile nearly flat (occupancy/register-bound). Our % vs Simon are essentially identical at 2K and 4K for every kernel — the gap is structural (tile sizes, block dim), not scale-dependent.
 
@@ -67,7 +67,7 @@ Even at 100% vs cuBLAS FP32 on H100, we'd only reach ~52 TFLOPS. Tensor Cores of
 | Step | Technique | File | Pranjal (4K) | Ours (4K) | Status |
 |---|---|---|---|---|---|
 | — | Simon's FP32 (H100) | — | 4.4% (31.8 T) | 4.6% (32.9 T) | ✅ Beat Simon |
-| K1 | **Tensor Core** | [`matmul_wmma.cu`](matmul_wmma.cu) | **44.3%** (317.6 T) | **5.7%** (27.5 T) | ⚠️ **7.8× gap** |
+| K1 | **Tensor Core** | [link](matmul_wmma.cu) | **44.3%** (317.6 T) | **5.7%** (27.5 T) | ⚠️ **7.8× gap** |
 | K2 | Larger tiles | 🆕 | 59.0% (423 T) | — | |
 | K3 | Async loads (TMA) | 🆕 | 69.5% (498 T) | — | |
 | K4 | Pushing tile size limit | 🆕 | 88.2% (632 T) | — | |
