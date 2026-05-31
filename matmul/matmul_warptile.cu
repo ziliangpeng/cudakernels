@@ -263,17 +263,17 @@ __global__ void matmulWarptileKernelT(const float * __restrict__ A,
     for (int sm = 0; sm < STM; sm++)
         #pragma unroll
         for (int i = 0; i < TM; i++) {
-            int gr = blockRow * BM + warpRow * WARP_M + sm * (WARP_M / STM) + thrRow * TM + i;
+            int lr = warpRow * WARP_M + sm * (WARP_M / STM) + thrRow * TM + i;
+            int gr = blockRow * BM + lr;
             if (gr < N) {
                 #pragma unroll
                 for (int sn = 0; sn < STN; sn++)
                     #pragma unroll
                     for (int j = 0; j < TN; j++) {
-                        int gc = blockCol * BN + warpCol * WARP_N + sn * (WARP_N / STN) + thrCol * TN + j;
+                        int lc = warpCol * WARP_N + sn * (WARP_N / STN) + thrCol * TN + j;
+                        int gc = blockCol * BN + lc;
                         if (gc < N)
-                            C[(warpRow * WARP_M + sm * (WARP_M / STM) + thrRow * TM + i) * N +
-                              (warpCol * WARP_N + sn * (WARP_N / STN) + thrCol * TN + j)] =
-                                acc[sm * TM + i][sn * TN + j];
+                            C[lr * N + lc] = acc[sm * TM + i][sn * TN + j];
                     }
             }
         }
