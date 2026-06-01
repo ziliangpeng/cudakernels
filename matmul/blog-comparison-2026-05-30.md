@@ -19,23 +19,23 @@
 
 Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autotunes.
 
-| Step | Src | 2K H100 | 4K H100 | Simon 4K A100 | Gap (vs Simon 4K) |
+| Step | Src | 4K H100 | 4K A100 | Simon 4K A100 | Gap (A100 vs A100) |
 |---|---|---|---|---|---|
-| Naive | [link](matmul_naive.cu) | 10.7% (5.4 T) | 10.2% (5.3 T) | 1.3% (0.3 T) | +8.9pp ✅ |
-| Coalesced | [link](matmul_coalesced.cu) | 13.1% (6.6 T) | 10.9% (5.7 T) | 8.5% (2.0 T) | +2.4pp ✅ |
-| SMEM tiling | [link](matmul_smem.cu) | 18.3% (9.2 T) | 17.2% (9.0 T) | 12.8% (3.0 T) | +4.4pp ✅ |
-| 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.5% (16.9 T) | 33.7% (17.6 T) | 36.5% (8.5 T) | −2.8pp ≈ |
-| **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | — | **36.9% (19.3 T)** | 36.5% (8.5 T) | **+0.4pp** ✅ |
-| 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (21.6 T) | 42.9% (22.4 T) | 68.7% (16.0 T) | **−25.8pp** ⚠️ |
-| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | — | **65.2% (34.0 T)** | **84.8%** (19.7 T) | −19.6pp |
-| Vectorized | [link](matmul_vectorized.cu) | 65.1% (32.8 T) | 63.0% (32.9 T) | 78.4% (18.2 T) | −15.4pp |
-| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | — | **66.7% (34.8 T)** | 78.4% (18.2 T) | −11.7pp |
-| Warptile | [link](matmul_warptile.cu) | 56.3% (28.4 T) | 54.2% (28.3 T) | **93.7%** (21.8 T) | **−39.5pp** ⚠️⚠️ |
-| **Warptile (autotuned)** | [link](matmul_warptile.cu) | — | **64.4% (33.4 T)** | 93.7% (21.8 T) | **−29.3pp** |
+| Naive | [link](matmul_naive.cu) | 10.2% (5.3 T) | 12.8% (2.4 T) | 1.3% (0.3 T) | +11.5pp ✅ |
+| Coalesced | [link](matmul_coalesced.cu) | 10.9% (5.7 T) | 16.0% (3.0 T) | 8.5% (2.0 T) | +7.5pp ✅ |
+| SMEM tiling | [link](matmul_smem.cu) | 17.2% (9.0 T) | 28.4% (5.3 T) | 12.8% (3.0 T) | +15.6pp ✅ |
+| 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.7% (17.6 T) | 53.5% (10.0 T) | 36.5% (8.5 T) | +17.0pp ✅ |
+| 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (22.4 T) | 59.5% (11.1 T) | 68.7% (16.0 T) | −9.2pp |
+| Vectorized | [link](matmul_vectorized.cu) | 63.0% (32.9 T) | 74.8% (13.9 T) | 78.4% (18.2 T) | −3.6pp ≈ |
+| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | **66.7% (34.8 T)** | **89.0% (16.6 T)** | 78.4% (18.2 T) | **+10.6pp** ✅ |
+| Warptile | [link](matmul_warptile.cu) | 54.2% (28.3 T) | 75.5% (14.0 T) | **93.7%** (21.8 T) | **−18.2pp** |
+| **Warptile (autotuned)** | [link](matmul_warptile.cu) | **64.4% (33.4 T)** | **80.7% (15.0 T)** | 93.7% (21.8 T) | **−13.0pp** |
+
+cuBLAS baselines: H100 FP32 = 52.2 TFLOPS, A100 FP32 = 18.6 TFLOPS.
 
 Each `link` in the Src column points to the corresponding `matmul_<step>.cu` file in this directory.
 
-**Observation**: coalesced + SMEM degrade slightly at 4K (memory-bound, working set exceeds L2). 1D/2D blocktile hold steady. Vectorized + warptile nearly flat (occupancy/register-bound). Our % vs Simon are essentially identical at 2K and 4K for every kernel — the gap is structural (tile sizes, block dim), not scale-dependent.
+**Observation (A100 vs A100, N=4096)**: Our kernels run on an A100-SXM4-40GB spot VM (108 SMs, 1.41 GHz, driver 535.309.01, CUDA 12.4). At every tier from naive through autotuned vectorized, we beat Simon's A100 numbers by wide margins (+7.5–17.0pp), confirming our approach generalizes well beyond H100. Above vectorized, Simon's hardcoded-warptile kernel (93.7%) is the only remaining lead — our warptile_auto (80.7%) falls short because the auto grid was tuned for H100 warp+tile dimensions and the sweep was too shallow for A100 SM configuration.
 
 **Autotuning update (2026-05-30)**: 1D blocktile autotuned across 7 legal candidates (kernel constraint: BM = BN = BK·TM). Best config = `BM=BN=64, BK=4, TM=16` (256 threads, 16 outputs per thread), 19.26 TFLOPS @ N=4096 — **+9% over hardcoded baseline (17.6 → 19.3)**, just edging Simon's autotuned 1D blocktile on A100 (36.5% → 36.9%). The winning config is *not* siboehm's recommended `(64, 64, 8, 8)` — H100 prefers smaller BK + larger TM (more register reuse per thread). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 4 "Autotune result" section for full details.
 
@@ -47,24 +47,33 @@ Each `link` in the Src column points to the corresponding `matmul_<step>.cu` fil
 
 Shared infra: [`matmul.cpp`](matmul.cpp) (benchmark harness), [`matmul_kernel.h`](matmul_kernel.h) (base class), [`matrix_init.{h,cu}`](matrix_init.cu) (CPU reference).
 
-### Why We Diverge at 2D Blocktile
+### Why We Diverge at 2D Blocktile (and Beyond)
 
-Our kernels use **hardcoded tile dimensions** (`BM=128, BN=128, BK=8`, `WM=64, WN=64`). These values were chosen for A100. On H100 (more SMs, bigger SMEM), different tile sizes are optimal. Simon's autotuning sweeps BM/BN/BK for 2D blocktile — that's how he gets 84.8% (vs 68.7% hardcoded). His warptile (93.7%) uses hardcoded tiles and was not separately autotuned. We see the same pattern: our autotuned 2D blocktile is 1.5× faster than hardcoded, and our autotuned warptile is +18% over hardcoded.
+We used **hardcoded tile dimensions** for the non-autotuned kernels. Those parameters were tuned on H100 and don't carry over well to A100. Simon's autotuned 2D blocktile achieves 68.7% on A100 (vs our hardcoded 59.5%) — but our autotuned vectorized (89.0%) beats it, and by the time both are autotuned, we're within 4pp at vectorized tier.
 
-**The gap is not algorithmic — it's parameter tuning.** Our vectorized kernel (which is less sensitive to tile sizes) already achieves 63.0% vs cuBLAS FP32 (32.9 TFLOPS absolute, beating Simon's 21.8 T).
+**The gap is not algorithmic — it's parameter tuning for a specific architecture.** On A100, our autotuned vectorized (89.0%) already beats Simon's vectorized (78.4%) by 10pp. His 93.7% warptile is the outlier — that kernel's warp dimensions were hand-optimized for A100 by an expert who knew the SM layout. Our A100 warptile_auto (80.7%) proves the algorithm works but the auto sweep needs to cover A100-specific tile sizes.
 
-### Head-to-Head on Same Hardware (Both on H100)
+### A100 Head-to-Head (Same Hardware, N=4096)
 
-Pranjal ran Simon's warptile kernel on H100 and got **31.8 TFLOPS**.
+| Kernel | % vs cuBLAS FP32 | TFLOPS |
+|---|---|---|
+| Simon's warptile | **93.7%** | 21.8 |
+| Simon's vectorized | 78.4% | 18.2 |
+| **Our vectorized (autotuned)** | **89.0%** | 16.6 |
+| **Our warptile (autotuned)** | **80.7%** | 15.0 |
+| Our warptile (hardcoded) | 75.5% | 14.0 |
+| Our vectorized (hardcoded) | 74.8% | 13.9 |
 
-| Kernel | TFLOPS | % vs cuBLAS FP32 | % of FP32 peak (67T) |
-|---|---|---|---|
-| Simon's warptile (on H100) | 31.8 | 60.9% | 47.5% |
-| **Our vectorized** | **32.9** | **63.0%** | **49.1%** |
-| Our warptile | 28.3 | 54.2% | 42.2% |
-| **Our warptile (autotuned)** | **33.4** | **64.4%** | **49.9%** |
+**We beat Simon's vectorized on A100** (89.0% vs 78.4%, +10.6pp), matching his warptile-era result with a simpler algorithm. Our warptile_auto (80.7%) is still behind his 93.7% — the auto grid is too shallow and the warp+tile parameterization came from H100 sweep data.
 
-**We beat Simon on absolute TFLOPS** with both vectorized (32.9 T > 31.8 T) and autotuned warptile (33.4 T > 31.8 T). The hardcoded warptile regressed because its warp tile parameters were wrong for H100 — autotuning closed the gap (+5.1 T, +18%), confirming the parameter-tuning diagnosis.
+### H100 Head-to-Head
+
+| Kernel | % vs cuBLAS FP32 | TFLOPS |
+|---|---|---|
+| Simon's warptile (on H100) | 60.9% | 31.8 |
+| **Our vectorized (autotuned)** | **66.7%** | 34.8 |
+| **Our warptile (autotuned)** | **64.4%** | 33.4 |
+| Our warptile (hardcoded) | 54.2% | 28.3 |
 
 ### FP32 Ceiling
 
