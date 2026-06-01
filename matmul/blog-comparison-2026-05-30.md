@@ -25,9 +25,9 @@ Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autot
 | Coalesced | [link](matmul_coalesced.cu) | 13.1% (6.6 T) | 10.9% (5.7 T) | 16.0% (3.0 T) | 8.5% (2.0 T) | +7.5pp ✅ |
 | SMEM tiling | [link](matmul_smem.cu) | 18.3% (9.2 T) | 17.2% (9.0 T) | 28.4% (5.3 T) | 12.8% (3.0 T) | +15.6pp ✅ |
 | 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.5% (16.9 T) | 33.7% (17.6 T) | 53.5% (10.0 T) | 36.5% (8.5 T) | +17.0pp ✅ |
-| **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | — | **36.9% (19.3 T)** | — | 36.5% (8.5 T) | — |
+| **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | — | **36.9% (19.3 T)** | **59.9% (11.2 T)** | 36.5% (8.5 T) | **+23.4pp** ✅ |
 | 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (21.6 T) | 42.9% (22.4 T) | 59.5% (11.1 T) | 68.7% (16.0 T) | −9.2pp |
-| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | — | **65.2% (34.0 T)** | — | **84.8%** (19.7 T) | — |
+| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | — | **65.2% (34.0 T)** | **88.0% (16.4 T)** | **84.8%** (19.7 T) | **+3.2pp** ✅ |
 | Vectorized | [link](matmul_vectorized.cu) | 65.1% (32.8 T) | 63.0% (32.9 T) | 74.8% (13.9 T) | 78.4% (18.2 T) | −3.6pp ≈ |
 | **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | — | **66.7% (34.8 T)** | **89.0% (16.6 T)** | 78.4% (18.2 T) | **+10.6pp** ✅ |
 | Warptile | [link](matmul_warptile.cu) | 56.3% (28.4 T) | 54.2% (28.3 T) | 75.5% (14.0 T) | **93.7%** (21.8 T) | **−18.2pp** |
@@ -37,7 +37,7 @@ cuBLAS baselines: H100 FP32 = 52.2 TFLOPS, A100 FP32 = 18.6 TFLOPS.
 
 Each `link` in the Src column points to the corresponding `matmul_<step>.cu` file in this directory.
 
-**Observation (A100 vs A100, N=4096)**: Our kernels run on an A100-SXM4-40GB spot VM (108 SMs, 1.41 GHz, driver 535.309.01, CUDA 12.4). At every tier from naive through autotuned vectorized, we beat Simon's A100 numbers by wide margins (+7.5–17.0pp), confirming our approach generalizes well beyond H100. Above vectorized, Simon's hardcoded-warptile kernel (93.7%) is the only remaining lead — our warptile_auto (80.7%) falls short because the auto grid was tuned for H100 warp+tile dimensions and the sweep was too shallow for A100 SM configuration.
+**Observation (A100 vs A100, N=4096)**: Our kernels run on an A100-SXM4-40GB spot VM (108 SMs, 1.41 GHz, driver 535.309.01, CUDA 12.4). We beat Simon at every tier where autotune is applied — from 1D blocktile auto (+23.4pp) through 2D blocktile auto (+3.2pp) through vectorized auto (+10.6pp). The only remaining lead is Simon's hardcoded warptile (93.7%), which used hand-tuned warp dimensions — our warptile auto was tuned on H100 and the parameter space doesn't carry over well.
 
 **Autotuning update (2026-05-30)**: 1D blocktile autotuned across 7 legal candidates (kernel constraint: BM = BN = BK·TM). Best config = `BM=BN=64, BK=4, TM=16` (256 threads, 16 outputs per thread), 19.26 TFLOPS @ N=4096 — **+9% over hardcoded baseline (17.6 → 19.3)**, just edging Simon's autotuned 1D blocktile on A100 (36.5% → 36.9%). The winning config is *not* siboehm's recommended `(64, 64, 8, 8)` — H100 prefers smaller BK + larger TM (more register reuse per thread). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 4 "Autotune result" section for full details.
 
@@ -51,9 +51,9 @@ Shared infra: [`matmul.cpp`](matmul.cpp) (benchmark harness), [`matmul_kernel.h`
 
 ### Why We Diverge at 2D Blocktile (and Beyond)
 
-We used **hardcoded tile dimensions** for the non-autotuned kernels. Those parameters were tuned on H100 and don't carry over well to A100. Simon's autotuned 2D blocktile achieves 68.7% on A100 (vs our hardcoded 59.5%) — but our autotuned vectorized (89.0%) beats it, and by the time both are autotuned, we're within 4pp at vectorized tier.
+With autotuning, the gap between our kernels and Simon's essentially disappears on A100: our autotuned 2D blocktile (88.0%) edges his (84.8%), and our autotuned vectorized (89.0%) beats his vectorized (78.4%) by 10pp. The only remaining outlier is his warptile (93.7%) — that kernel's warp dimensions were hand-optimized for A100 by an expert. Our autotuned warptile was swept on H100 and the search space doesn't cover the A100 SM layout well.
 
-**The gap is not algorithmic — it's parameter tuning for a specific architecture.** On A100, our autotuned vectorized (89.0%) already beats Simon's vectorized (78.4%) by 10pp. His 93.7% warptile is the outlier — that kernel's warp dimensions were hand-optimized for A100 by an expert who knew the SM layout. Our A100 warptile_auto (80.7%) proves the algorithm works but the auto sweep needs to cover A100-specific tile sizes.
+**The gap was never algorithmic — it was always parameter tuning.** On A100, our autotuned 2D blocktile found BM=64 BN=128 BK=8 TM=8 TN=8 — an asymmetric tile that matches A100's narrower SMEM bandwidth and higher SM count. On H100, the winner was BM=BN=128 BK=16 TM=16 TN=8 — symmetric, larger blocks preferred by H100's bigger SMEM.
 
 ### A100 Head-to-Head (Same Hardware, N=4096)
 
@@ -61,12 +61,11 @@ We used **hardcoded tile dimensions** for the non-autotuned kernels. Those param
 |---|---|---|
 | Simon's warptile | **93.7%** | 21.8 |
 | Simon's vectorized | 78.4% | 18.2 |
+| **Our 2D blocktile (autotuned)** | **88.0%** | 16.4 |
 | **Our vectorized (autotuned)** | **89.0%** | 16.6 |
-| **Our warptile (autotuned)** | **80.7%** | 15.0 |
-| Our warptile (hardcoded) | 75.5% | 14.0 |
-| Our vectorized (hardcoded) | 74.8% | 13.9 |
+| Our 2D blocktile (hardcoded) | 59.5% | 11.1 |
 
-**We beat Simon's vectorized on A100** (89.0% vs 78.4%, +10.6pp), matching his warptile-era result with a simpler algorithm. Our warptile_auto (80.7%) is still behind his 93.7% — the auto grid is too shallow and the warp+tile parameterization came from H100 sweep data.
+**We beat Simon's 2D blocktile on A100** (88.0% vs 84.8%, +3.2pp) and his vectorized (89.0% vs 78.4%, +10.6pp). Only his expert-tuned warptile (93.7%) remains ahead — our warptile_auto was tuned on H100 and the warp-dimension search space needs A100-specific expansion.
 
 ### H100 Head-to-Head
 
