@@ -19,17 +19,17 @@
 
 Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autotunes.
 
-| Step | Src | 4K H100 | 4K A100 | Simon 4K A100 | Gap (A100 vs A100) |
-|---|---|---|---|---|---|
-| Naive | [link](matmul_naive.cu) | 10.2% (5.3 T) | 12.8% (2.4 T) | 1.3% (0.3 T) | +11.5pp ✅ |
-| Coalesced | [link](matmul_coalesced.cu) | 10.9% (5.7 T) | 16.0% (3.0 T) | 8.5% (2.0 T) | +7.5pp ✅ |
-| SMEM tiling | [link](matmul_smem.cu) | 17.2% (9.0 T) | 28.4% (5.3 T) | 12.8% (3.0 T) | +15.6pp ✅ |
-| 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.7% (17.6 T) | 53.5% (10.0 T) | 36.5% (8.5 T) | +17.0pp ✅ |
-| 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (22.4 T) | 59.5% (11.1 T) | 68.7% (16.0 T) | −9.2pp |
-| Vectorized | [link](matmul_vectorized.cu) | 63.0% (32.9 T) | 74.8% (13.9 T) | 78.4% (18.2 T) | −3.6pp ≈ |
-| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | **66.7% (34.8 T)** | **89.0% (16.6 T)** | 78.4% (18.2 T) | **+10.6pp** ✅ |
-| Warptile | [link](matmul_warptile.cu) | 54.2% (28.3 T) | 75.5% (14.0 T) | **93.7%** (21.8 T) | **−18.2pp** |
-| **Warptile (autotuned)** | [link](matmul_warptile.cu) | **64.4% (33.4 T)** | **80.7% (15.0 T)** | 93.7% (21.8 T) | **−13.0pp** |
+| Step | Src | 2K H100 | 4K H100 | 4K A100 | Simon 4K A100 | Gap (A100 vs A100) |
+|---|---|---|---|---|---|---|---|
+| Naive | [link](matmul_naive.cu) | 10.7% (5.4 T) | 10.2% (5.3 T) | 12.8% (2.4 T) | 1.3% (0.3 T) | +11.5pp ✅ |
+| Coalesced | [link](matmul_coalesced.cu) | 13.1% (6.6 T) | 10.9% (5.7 T) | 16.0% (3.0 T) | 8.5% (2.0 T) | +7.5pp ✅ |
+| SMEM tiling | [link](matmul_smem.cu) | 18.3% (9.2 T) | 17.2% (9.0 T) | 28.4% (5.3 T) | 12.8% (3.0 T) | +15.6pp ✅ |
+| 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.5% (16.9 T) | 33.7% (17.6 T) | 53.5% (10.0 T) | 36.5% (8.5 T) | +17.0pp ✅ |
+| 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (21.6 T) | 42.9% (22.4 T) | 59.5% (11.1 T) | 68.7% (16.0 T) | −9.2pp |
+| Vectorized | [link](matmul_vectorized.cu) | 65.1% (32.8 T) | 63.0% (32.9 T) | 74.8% (13.9 T) | 78.4% (18.2 T) | −3.6pp ≈ |
+| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | — | **66.7% (34.8 T)** | **89.0% (16.6 T)** | 78.4% (18.2 T) | **+10.6pp** ✅ |
+| Warptile | [link](matmul_warptile.cu) | 56.3% (28.4 T) | 54.2% (28.3 T) | 75.5% (14.0 T) | **93.7%** (21.8 T) | **−18.2pp** |
+| **Warptile (autotuned)** | [link](matmul_warptile.cu) | — | **64.4% (33.4 T)** | **80.7% (15.0 T)** | 93.7% (21.8 T) | **−13.0pp** |
 
 cuBLAS baselines: H100 FP32 = 52.2 TFLOPS, A100 FP32 = 18.6 TFLOPS.
 
