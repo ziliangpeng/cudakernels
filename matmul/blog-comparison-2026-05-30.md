@@ -20,7 +20,7 @@
 Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autotunes.
 
 | Step | Src | 2K H100 | 4K H100 | 4K A100 | Simon 4K A100 | Gap (A100 vs A100) |
-|---|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|
 | Naive | [link](matmul_naive.cu) | 10.7% (5.4 T) | 10.2% (5.3 T) | 12.8% (2.4 T) | 1.3% (0.3 T) | +11.5pp ✅ |
 | Coalesced | [link](matmul_coalesced.cu) | 13.1% (6.6 T) | 10.9% (5.7 T) | 16.0% (3.0 T) | 8.5% (2.0 T) | +7.5pp ✅ |
 | SMEM tiling | [link](matmul_smem.cu) | 18.3% (9.2 T) | 17.2% (9.0 T) | 28.4% (5.3 T) | 12.8% (3.0 T) | +15.6pp ✅ |
