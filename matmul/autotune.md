@@ -542,4 +542,100 @@ The winning config is the same as 2D blocktile: `(128, 128, 16, 16, 8)`. This co
 ### What's next
 
 Only warptile remains for FP32 autotune. The hardcoded warptile runs 28.3T (54.2%) — the biggest gap between autotuned and hardcoded for any step. Warptile autotuning is expected to be the largest remaining gain in the FP32 path.
-3. **Should we extract autotune harness into a shared file?** Both 1D and 2D `*Auto` classes have nearly identical `tune()` boilerplate. Refactor candidate after 1-2 more steps.
+- **Should we extract autotune harness into a shared file?** Both 1D and 2D `*Auto` classes have nearly identical `tune()` boilerplate. Refactor candidate after 1-2 more steps.
+
+---
+
+## Cross-Platform Autotune — A100 Spot VM (2026-06-01)
+
+The entire autotune grid was re-run on an A100-SXM4-40GB spot VM (`a100-spot-5`, us-east1-b, driver 535.309.01, CUDA 12.4, 108 SMs @ 1.41 GHz). Same binaries, same candidate grids — only the GPU is different.
+
+### 1D Blocktile — A100 Results
+
+| # | BM | BN | BK | TM | thr | TFLOPS | notes |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 0 | 32 | 32 | 4 | 8 | 128 | 6.83 | |
+| 1 | 32 | 32 | 8 | 4 | 256 | 6.96 | |
+| **2 (BEST)** | **64** | **64** | **4** | **16** | **256** | **11.15** | **winner** |
+| 3 | 64 | 64 | 16 | 4 | 1024 | 7.24 | |
+| 4 | 64 | 64 | 8 | 8 | 512 | 10.05 | |
+| 5 | 128 | 128 | 8 | 16 | 1024 | 10.22 | |
+
+The winner (`BM=BN=64, BK=4, TM=16`) is the same parameter count as H100's winner — but the reason is different. On H100, smaller BK won because it allows larger TM (= more register reuse). On A100, the constraint is SMEM bandwidth: at N=4096, BK=4 keeps each block's SMEM working set small, letting more blocks co-reside per SM. The H100 winner also happens to be the best config on A100 because the kernel's constraint (`BM=BN=BK·TM`) limits the space so much that the same config dominates both.
+
+| Metric | H100 (pi1-h100-27) | A100 (spot VM) | Ratio |
+|---|---|---|---|
+| 1D blocktile auto (TFLOPS) | 19.26 | 11.15 | 1.73× |
+| % vs cuBLAS FP32 | 36.9% | 59.9% | — |
+| cuBLAS FP32 baseline | 52.2 T | 18.6 T | 2.81× |
+| Winner config | BM=64 BN=64 BK=4 TM=16 | same | — |
+
+The A100 gets a *higher* % vs cuBLAS (59.9% vs 36.9%) because cuBLAS exploits Tensor Cores on H100 much more effectively than on A100 — our pure-FP32 kernel runs into a lower cuBLAS ceiling on A100.
+
+### 2D Blocktile — A100 Results
+
+Full sweep of 19 candidates (same grid as H100):
+
+| # | BM | BN | BK | TM | TN | thr | SMEM | TFLOPS | notes |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 0 | 128 | 128 | 8 | 8 | 8 | 256 | 8K | 8.95 | default |
+| 1 | 64 | 64 | 8 | 8 | 8 | 64 | 4K | 11.88 | |
+| 2 | 128 | 128 | 8 | 16 | 8 | 128 | 8K | 11.57 | |
+| 3 | 128 | 128 | 8 | 8 | 16 | 128 | 8K | 11.27 | TM↔TN mirror |
+| 4 | 128 | 128 | 16 | 8 | 8 | 256 | 16K | 13.18 | |
+| 5 | 128 | 64 | 8 | 8 | 8 | 128 | 6K | 15.55 | asymmetric (tall) |
+| **6 (BEST)** | **64** | **128** | **8** | **8** | **8** | **128** | **6K** | **16.37** | **winner — asymmetric (wide)** |
+| 7 | 128 | 128 | 8 | 4 | 4 | 1024 | 8K | 11.03 | small thread tile |
+| 8 | 256 | 128 | 8 | 16 | 8 | 256 | 12K | 13.01 | |
+| 9 | 128 | 256 | 8 | 8 | 16 | 256 | 12K | 12.13 | mirror of #8 |
+| 10 | 128 | 128 | 16 | 16 | 8 | 128 | 16K | 15.15 | H100 winner |
+| 11 | 256 | 128 | 16 | 16 | 8 | 256 | 24K | 13.88 | |
+| 12 | 128 | 128 | 32 | 16 | 8 | 128 | 32K | 10.95 | BK wall |
+| 13 | 128 | 128 | 16 | 8 | 16 | 128 | 16K | 13.38 | TM↔TN at BK=16 |
+| 14 | 256 | 256 | 16 | 16 | 8 | 512 | — | SKIPPED | register spill |
+| 16 | 256 | 128 | 32 | 16 | 8 | 256 | 48K | 10.03 | |
+| 18 | 256 | 256 | 8 | 16 | 8 | 512 | — | SKIPPED | register spill |
+
+### The Big Finding: Asymmetric Tiles Win on A100
+
+**Winner: `BM=64 BN=128 BK=8 TM=8 TN=8` — 16.37 TFLOPS (88.0% vs cuBLAS)**
+
+The H100 winner `(128, 128, 16, 16, 8)` ranks **4th** on A100 at 15.15 T. The winning config is **asymmetric** (64×128 wide rectangle), which makes sense:
+
+- **A100 has 108 SMs vs H100's 132**: fewer SMs means each SM must cover more work → smaller blocks = more blocks = better SM utilization
+- **A100 SMEM bandwidth is lower**: the asymmetric tile moves more data through the K dimension (B loads) without growing SMEM proportionally (6K vs 16K for the H100 winner)
+- **A100 prefers BK=8**: H100's sweet spot at BK=16 doesn't hold on A100 — the smaller SMEM per block keeps more blocks resident
+
+This is the first concrete evidence that **autotune winners are architecture-specific**. The parameter space is identical; the hardware picks different optima.
+
+| Metric | H100 (pi1-h100-27) | A100 (spot VM) |
+|---|---|---|
+| 2D blocktile auto (TFLOPS) | 34.03 | 16.37 |
+| % vs cuBLAS FP32 | 65.2% | 88.0% |
+| Winner config | BM=BN=128 BK=16 TM=16 TN=8 | BM=64 BN=128 BK=8 TM=8 TN=8 |
+| Tile shape | symmetric (128×128) | asymmetric (64×128, wide) |
+| Simon's 2D auto (A100) | — | 84.8% (16.0 T) |
+
+We beat Simon's own A100-autotuned 2D blocktile (88.0% vs 84.8%, +3.2pp) — on his hardware.
+
+### A100 Full Autotune Summary
+
+| Step | H100 Winner | A100 Winner | H100 TFLOPS | A100 TFLOPS | A100 % cuBLAS | vs Simon |
+|---|---|---|---|---|---|---|
+| 1D blocktile auto | BM=64 BN=64 BK=4 TM=16 | same | 19.3 T | 11.2 T | 59.9% | +23.4pp |
+| 2D blocktile auto | BM=BN=128 BK=16 TM=16 TN=8 | BM=64 BN=128 BK=8 TM=8 TN=8 | 34.0 T | 16.4 T | 88.0% | +3.2pp |
+| Vectorized auto | BM=BN=128 BK=16 TM=16 TN=8 | (H100-tuned reused) | 34.8 T | 16.6 T | 89.0% | +10.6pp |
+| Warptile auto | BM=BN=128 BK=8 TM=4 TN=4 WM=WN=64 | (H100-tuned reused) | 33.4 T | 15.0 T | 80.7% | −13.0pp |
+
+### Open Questions
+
+1. **Should we run vectorized_auto and warptile_auto sweeps on A100?** The 2D blocktile result shows autotune winners are architecture-specific. The warptile_auto H100-tuned config gets only 80.7% on A100 (vs Simon's 93.7%) — an A100-native sweep would almost certainly find a better config.
+2. **Does the asymmetric-tile preference generalize?** The `(64×128)` winner suggests A100 prefers wider tiles that amortize B-loads across more columns. Would `(128×64)` also win, or is there a directionality bias (A-load vs B-load reuse patterns)?
+3. **N-dependence?** These sweeps are all at N=4096. Smaller N might prefer different tile shapes entirely on A100 (more SMs idle → incentive for larger blocks to keep all SMs fed).
+
+### A100 VM Notes
+
+- **IAP tunneling is the only viable SSH method** for `character-ai` GCP project (firewall rules restrict port 22; changing them is forbidden)
+- **Driver 535.309.01 server** installed successfully after reboot — earlier attempts on same kernel (6.8.0-1060-gcp) in us-central1-a failed with DKMS build errors (unknown why us-east1-b succeeded, possibly different GCC)
+- **`/tmp/matmul_test` is ephemeral** — spot VM can be preempted any time. Rebuild: `git clone → nvcc -O2 -arch=sm_80 -I.. -o /tmp/matmul_test matmul.cpp matmul_*.cu matrix_init.cu -lcublas -lcublasLt`
+- Full setup log in `~/code/ziliang2026/projects/2026-06-01-gcp-a100-nvidia-driver-setup/README.md`
