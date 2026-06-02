@@ -51,6 +51,19 @@ Each `link` in the Src column points to the corresponding `matmul_<step>.cu` fil
 
 **cuBLAS baseline can't be used for cross-paper normalization**: his % is TF32-relative (23.2 T), ours is FP32-relative (18.6 T). TFLOPS is the common unit — by that measure, Simon's absolute 19.7 T > our 16.4 T at 2D autotuned.
 
+### Important Hardware Note: A6000 vs A100 FP32 Compute
+
+Although A100 has more SMs (108 vs 84), **A6000 actually has higher pure FP32 theoretical peak performance**:
+
+| GPU | Architecture | SMs | FP32 CUDA Cores per SM | **FP32 Peak (Boost)** |
+|-----|--------------|-----|------------------------|-----------------------|
+| **RTX A6000** | GA102 | 84 | 128 | **38.7 TFLOPS** |
+| **A100-SXM4** | GA100 | 108 | 64 | **19.5 TFLOPS** |
+
+This is a critical point: A6000's FP32 compute capability is nearly **2×** that of A100. This is because GA102 SMs are designed with more FP32 execution units, while GA100 SMs prioritize Tensor Cores.
+
+This explains part of why Simon can achieve higher absolute TFLOPS despite having fewer SMs — his hardware simply has more raw FP32 compute power.
+
 ### Why Simon's Kernels Are More Efficient Per-SM
 
 Source-code reading of `siboehm/SGEMM_CUDA/src/runner.cu` reveals key design differences:
