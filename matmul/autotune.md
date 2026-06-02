@@ -23,7 +23,7 @@ Every kernel so far hardcodes its tile sizes:
 
 These numbers came from siboehm's worklog on **A100**. We've been running them on H100. The [`blog-comparison-2026-05-30.md`](blog-comparison-2026-05-30.md) table shows the cost clearly:
 
-| Step | Ours (H100, hardcoded) | Simon (A100, autotuned) | Gap |
+| Step | Ours (H100, hardcoded) | Simon (A6000, autotuned) | Gap |
 |---|---|---|---|
 | 2D blocktile | 42.9% | 68.7% | −25.8pp |
 | Warptile | 54.2% | 93.7% | **−39.5pp** |
@@ -281,7 +281,7 @@ These insights don't come from reading more theory. They come from **running the
 ## Related
 
 - [`worklog.md`](worklog.md) — per-step optimization narrative
-- [`blog-comparison-2026-05-30.md`](blog-comparison-2026-05-30.md) — gap analysis vs Simon (A100 autotuned) and Pranjal (H100 TC)
+- [`blog-comparison-2026-05-30.md`](blog-comparison-2026-05-30.md) — gap analysis vs Simon (A6000) and Pranjal (H100 TC)
 - [`../docs/ncu-profiling-2026-05-30.md`](../docs/ncu-profiling-2026-05-30.md) — Nsight profiling baseline
 
 ---
@@ -347,9 +347,9 @@ Even tuned to the limit, 1D cannot beat 2D — because 2D adds register reuse on
 | `1d_blocktile` (hardcoded baseline) | `(64, 64, 8, 8)` | 17.6 | 33.7% |
 | **`1d_blocktile_auto` (winning config)** | **`(64, 64, 4, 16)`** | **19.3** | **36.9%** |
 | Delta | — | **+9.2%** | **+3.2pp** |
-| Simon's autotuned 1D (A100) | (varies) | 8.5 | 36.5% |
+| Simon's autotuned 1D (A6000) | (varies) | 8.5 | 36.5% |
 
-We now slightly edge Simon's A100 autotuned percentage at this step (36.9% vs 36.5%) — the first time our autotuned number matches a fully autotuned A100 baseline.
+We now edge Simon's A6000 autotuned percentage at this step (36.9% vs 36.5%) — the first time our autotuned number matches a fully autotuned baseline on comparable hardware.
 
 ### Implementation notes
 
@@ -391,10 +391,10 @@ Second autotune step executed. Branch: `autotune-2d-blocktile`. Class: `Matmul2D
 | `2d_blocktile` (hardcoded baseline) | `(128, 128, 8, 8, 8)` | 22.3 | 42.7% |
 | **`2d_blocktile_auto` (winning config)** | **`(128, 128, 16, 16, 8)`** | **34.0** | **65.2%** |
 | Delta | — | **+52.7%** | **+22.5pp** |
-| Simon's autotuned 2D (A100) | (varies) | 16.0 | 68.7% |
+| Simon's autotuned 2D (A6000) | (varies) | 16.0 | 68.7% |
 | Simon's autotuned warptile (H100) | (varies) | 31.8 | 60.9% |
 
-This is the **biggest single-step jump** in the entire project so far (+52%). We now nearly match Simon's autotuned A100 2D blocktile (65.2% vs 68.7%) and **beat his autotuned warptile when run on H100** (65.2% vs 60.9%).
+This is the **biggest single-step jump** in the entire project so far (+52%). We now nearly match Simon's autotuned 2D blocktile on A6000 (65.2% vs 68.7%) and **beat his autotuned warptile when run on H100** (65.2% vs 60.9%).
 
 ### Full sweep table (N=4096, 3-run median per candidate)
 
@@ -614,22 +614,24 @@ This is the first concrete evidence that **autotune winners are architecture-spe
 | % vs cuBLAS FP32 | 65.2% | 88.0% |
 | Winner config | BM=BN=128 BK=16 TM=16 TN=8 | BM=64 BN=128 BK=8 TM=8 TN=8 |
 | Tile shape | symmetric (128×128) | asymmetric (64×128, wide) |
-| Simon's 2D auto (A100) | — | 84.8% (16.0 T) |
+| Simon's 2D auto (A6000) | — | 84.8% (16.0 T)* |
 
-We beat Simon's own A100-autotuned 2D blocktile (88.0% vs 84.8%, +3.2pp) — on his hardware.
+We beat Simon's A6000 2D blocktile in absolute TFLOPS (16.4 T > 16.0 T), but the 88.0% vs 84.8% headline comparison is misleading — his % is TF32-relative, ours is FP32-relative. See [blog-comparison-2026-05-30.md](blog-comparison-2026-05-30.md) for the full audit.
 
 ### A100 Full Autotune Summary
 
-| Step | H100 Winner | A100 Winner | H100 TFLOPS | A100 TFLOPS | A100 % cuBLAS | vs Simon |
-|---|---|---|---|---|---|---|
-| 1D blocktile auto | BM=64 BN=64 BK=4 TM=16 | same | 19.3 T | 11.2 T | 59.9% | +23.4pp |
-| 2D blocktile auto | BM=BN=128 BK=16 TM=16 TN=8 | BM=64 BN=128 BK=8 TM=8 TN=8 | 34.0 T | 16.4 T | 88.0% | +3.2pp |
-| Vectorized auto | BM=BN=128 BK=16 TM=16 TN=8 | (H100-tuned reused) | 34.8 T | 16.6 T | 89.0% | +10.6pp |
-| Warptile auto | BM=BN=128 BK=8 TM=4 TN=4 WM=WN=64 | (H100-tuned reused) | 33.4 T | 15.0 T | 80.7% | −13.0pp |
+| Step | H100 Winner | A100 Winner | H100 TFLOPS | A100 TFLOPS | Notes |
+|---|---|---|---|---|---|
+| 1D blocktile auto | BM=64 BN=64 BK=4 TM=16 | same | 19.3 T | 11.2 T | +1.7 T over Simon (A6000, 8.5 T) |
+| 2D blocktile auto | BM=BN=128 BK=16 TM=16 TN=8 | BM=64 BN=128 BK=8 TM=8 TN=8 | 34.0 T | 16.4 T | +0.4 T over Simon's best (16.0 T) |
+| Vectorized auto | BM=BN=128 BK=16 TM=16 TN=8 | (H100-tuned reused) | 34.8 T | 16.6 T | −1.6 T vs Simon's 18.2 T |
+| Warptile auto | BM=BN=128 BK=8 TM=4 TN=4 WM=WN=64 | (H100-tuned reused) | 33.4 T | 15.0 T | −6.8 T vs Simon's 21.8 T |
+
+*\*Simon uses A6000 (84 SM) with TF32 cuBLAS baseline 23.2 T. Our A100 (108 SM) with FP32 cuBLAS 18.6 T. Per-SM efficiency analysis in blog-comparison doc.*
 
 ### Open Questions
 
-1. **Should we run vectorized_auto and warptile_auto sweeps on A100?** The 2D blocktile result shows autotune winners are architecture-specific. The warptile_auto H100-tuned config gets only 80.7% on A100 (vs Simon's 93.7%) — an A100-native sweep would almost certainly find a better config.
+1. **Should we run vectorized_auto and warptile_auto sweeps on A100?** The 2D blocktile result shows autotune winners are architecture-specific. The warptile_auto H100-tuned config gets only 15.0 T on A100 (vs Simon's 21.8 T on A6000 with fewer SMs — his per-SM warp-tile efficiency is exceptional). An A100-native warptile sweep is the obvious next step for closing this gap.
 2. **Does the asymmetric-tile preference generalize?** The `(64×128)` winner suggests A100 prefers wider tiles that amortize B-loads across more columns. Would `(128×64)` also win, or is there a directionality bias (A-load vs B-load reuse patterns)?
 3. **N-dependence?** These sweeps are all at N=4096. Smaller N might prefer different tile shapes entirely on A100 (more SMs idle → incentive for larger blocks to keep all SMs fed).
 

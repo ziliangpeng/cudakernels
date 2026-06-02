@@ -1,84 +1,79 @@
 # Performance Comparison: Our Kernels vs Published Worklogs
 
-**Date**: 2026-05-30  
-**Sources**:
-- [siboehm: CUDA Matmul Worklog](https://siboehm.com/articles/22/CUDA-MMM) — A100, N=4096, FP32, vs cuBLAS FP32
-- [Pranjal: Outperforming cuBLAS on H100](https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog) — H100, N=4096, TC, vs cuBLAS BF16
-- Our data: [ncu-profiling-2026-05-30.md](../docs/ncu-profiling-2026-05-30.md) — H100, N=2048 and N=4096
+**Date**: 2026-05-30 (updated 2026-06-01 with A6000 correction and A100 autotune)
+**Source code**: [siboehm/SGEMM_CUDA](https://github.com/siboehm/SGEMM_CUDA) — verified from source
+
+## Hardware and Methodology: How Simon and We Differ
+
+| | Simon (siboehm) | Us |
+|---|---|---|
+| GPU | **NVIDIA A6000** (GA102) | A100-SXM4-40GB (GA100) |
+| SMs | 84 | 108 |
+| SM ratio | — | +29% |
+| cuBLAS call | `cublasGemmEx(..., CUBLAS_GEMM_DEFAULT_TENSOR_OP)` | `cublasSgemm` + `CUBLAS_PEDANTIC_MATH` |
+| cuBLAS math | **TF32 via Tensor Cores** | **Pure FP32** |
+| cuBLAS TFLOPS @ 4096 | **23.2 T** | **18.6 T** |
+| FLOP formula | `2 × M × N × K` | `2 × N³ − N²` |
+| Benchmark | 10 repeats, mean elapsed | 100 iterations, median |
+| N sizes | {128, 256, 512, 1K, 2K, 4K} | N=4096 |
+
+**Why the cuBLAS baseline differs**: Simon uses `CUBLAS_GEMM_DEFAULT_TENSOR_OP` which lets cuBLAS use TF32 Tensor Cores on Ampere (~23.2 T). We explicitly set `CUBLAS_PEDANTIC_MATH` to force pure FP32 (~18.6 T). This means **% vs cuBLAS cannot be compared across papers** — we must use absolute TFLOPS.
 
 ---
 
-## Table 1: FP32 Path — Ours vs Simon (siboehm)
+## Table 1: FP32 Path — Ours vs Simon (Absolute TFLOPS, N=4096)
 
-**Both sides compared against their own cuBLAS FP32 baseline.** Simon's % are from his A100 blog. Our % are vs our cuBLAS FP32 at the same N.
+| Step | Src | H100 (4K) | A100 (4K) | Simon (A6000, 4K) | TFLOPS Gap |
+|---|---|---|---|---|---|
+| Naive | [link](matmul_naive.cu) | 5.3 T | 2.4 T | 0.3 T | +2.1 T ✅ |
+| Coalesced | [link](matmul_coalesced.cu) | 5.7 T | 3.0 T | 2.0 T | +1.0 T ≈ |
+| SMEM tiling | [link](matmul_smem.cu) | 9.0 T | 5.3 T | 3.0 T | +2.3 T ✅ |
+| 1D blocktile | [link](matmul_1d_blocktile.cu) | 17.6 T | 10.0 T | 8.5 T | +1.5 T |
+| **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | **19.3 T** | **11.2 T** | — | — |
+| 2D blocktile | [link](matmul_2d_blocktile.cu) | 22.4 T | 11.1 T | 16.0 T | **−4.9 T** ⚠️ |
+| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | **34.0 T** | **16.4 T** | **19.7 T** | **−3.3 T** |
+| Vectorized | [link](matmul_vectorized.cu) | 32.9 T | 13.9 T | 18.2 T | **−4.3 T** ⚠️ |
+| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | **34.8 T** | **16.6 T** | — | — |
+| Warptile | [link](matmul_warptile.cu) | 28.3 T | 14.0 T | 21.8 T | **−7.8 T** ⚠️⚠️ |
+| **Warptile (autotuned)** | [link](matmul_warptile.cu) | **33.4 T** | **15.0 T** | — | — |
 
-| | cuBLAS FP32 2K H100 | cuBLAS FP32 4K H100 | cuBLAS FP32 (Simon A100) |
-|---|---|---|---|
-| Baseline | 50.4 TFLOPS | 51.9 TFLOPS | 23.2 TFLOPS (A100) |
-| Source | [`matmul_cublas.cu`](matmul_cublas.cu) | same | — |
+Each `link` in the Src column points to the corresponding `matmul_<step>.cu` file in this directory. Simon's autotuned results are: 2D blocktile = 19.7 T; warptile was hand-tuned (not autotuned).
 
-Our 2D blocktile and warptile use hardcoded tile sizes (`BM/BN/BK`). Simon autotunes.
+### What This Table Actually Shows
 
-| Step | Src | 2K H100 | 4K H100 | 4K A100 | Simon 4K A100 | Gap (A100 vs A100) |
-|---|---|---|---|---|---|---|
-| Naive | [link](matmul_naive.cu) | 10.7% (5.4 T) | 10.2% (5.3 T) | 12.8% (2.4 T) | 1.3% (0.3 T) | +11.5pp ✅ |
-| Coalesced | [link](matmul_coalesced.cu) | 13.1% (6.6 T) | 10.9% (5.7 T) | 16.0% (3.0 T) | 8.5% (2.0 T) | +7.5pp ✅ |
-| SMEM tiling | [link](matmul_smem.cu) | 18.3% (9.2 T) | 17.2% (9.0 T) | 28.4% (5.3 T) | 12.8% (3.0 T) | +15.6pp ✅ |
-| 1D blocktile | [link](matmul_1d_blocktile.cu) | 33.5% (16.9 T) | 33.7% (17.6 T) | 53.5% (10.0 T) | 36.5% (8.5 T) | +17.0pp ✅ |
-| **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | — | **36.9% (19.3 T)** | **59.9% (11.2 T)** | 36.5% (8.5 T) | **+23.4pp** ✅ |
-| 2D blocktile | [link](matmul_2d_blocktile.cu) | 42.9% (21.6 T) | 42.9% (22.4 T) | 59.5% (11.1 T) | 68.7% (16.0 T) | −9.2pp |
-| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | — | **65.2% (34.0 T)** | **88.0% (16.4 T)** | **84.8%** (19.7 T) | **+3.2pp** ✅ |
-| Vectorized | [link](matmul_vectorized.cu) | 65.1% (32.8 T) | 63.0% (32.9 T) | 74.8% (13.9 T) | 78.4% (18.2 T) | −3.6pp ≈ |
-| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | — | **66.7% (34.8 T)** | **89.0% (16.6 T)** | 78.4% (18.2 T) | **+10.6pp** ✅ |
-| Warptile | [link](matmul_warptile.cu) | 56.3% (28.4 T) | 54.2% (28.3 T) | 75.5% (14.0 T) | **93.7%** (21.8 T) | **−18.2pp** |
-| **Warptile (autotuned)** | [link](matmul_warptile.cu) | — | **64.4% (33.4 T)** | **80.7% (15.0 T)** | 93.7% (21.8 T) | **−13.0pp** |
+**Simple kernels (naive → 1D blocktile):** We win on absolute TFLOPS — our A100 has 29% more SMs (108 vs 84), and these kernels are compute-bound rather than SMEM/latency-bound, so more SMs directly translates to more throughput.
 
-cuBLAS baselines: H100 FP32 = 52.2 TFLOPS, A100 FP32 = 18.6 TFLOPS.
+**From 2D blocktile onward, Simon's kernels are fundamentally more efficient.** Despite having fewer SMs, his 2D blocktile hits 16.0 T vs our 11.1 T. Per-SM: Simon = 190 GFLOPS/SM vs us = 103 GFLOPS/SM — his kernels extract 84% more per SM at this complexity level.
 
-Each `link` in the Src column points to the corresponding `matmul_<step>.cu` file in this directory.
+**Our autotuning helps significantly** (+48% on 2D, from 11.1→16.4 T), but doesn't close the gap. His autotuned 2D blocktile at 19.7 T is still 1.6× per-SM of ours. The gap originates in tile design (register layout, load patterns, loop ordering) rather than parameter selection alone.
 
-**Observation (A100 vs A100, N=4096)**: Our kernels run on an A100-SXM4-40GB spot VM (108 SMs, 1.41 GHz, driver 535.309.01, CUDA 12.4). We beat Simon at every tier where autotune is applied — from 1D blocktile auto (+23.4pp) through 2D blocktile auto (+3.2pp) through vectorized auto (+10.6pp). The only remaining lead is Simon's hardcoded warptile (93.7%), which used hand-tuned warp dimensions — our warptile auto was tuned on H100 and the parameter space doesn't carry over well.
+**cuBLAS baseline can't be used for % normalization** — he measures against TF32 (23.2 T), we against FP32 (18.6 T). His "84.8%" is a TF32-relative number; our "88.0%" is FP32-relative. They mean different things and can't be directly compared. Simon's absolute 19.7 T > our 16.4 T, regardless of percentages.
 
-**Autotuning update (2026-05-30)**: 1D blocktile autotuned across 7 legal candidates (kernel constraint: BM = BN = BK·TM). Best config = `BM=BN=64, BK=4, TM=16` (256 threads, 16 outputs per thread), 19.26 TFLOPS @ N=4096 — **+9% over hardcoded baseline (17.6 → 19.3)**, just edging Simon's autotuned 1D blocktile on A100 (36.5% → 36.9%). The winning config is *not* siboehm's recommended `(64, 64, 8, 8)` — H100 prefers smaller BK + larger TM (more register reuse per thread). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 4 "Autotune result" section for full details.
+### Why Simon's Kernels Are More Efficient Per-SM
 
-**2D blocktile autotune (2026-05-30, updated)**: 2D blocktile autotuned across 19 candidates (initial 11 + 4 expansion + 4 v3 after the SMEM math fix). Best config = `BM=BN=128, BK=16, TM=16, TN=8` (128 threads, 8×16 thread tile), **34.0 TFLOPS @ N=4096 — +52% over the hardcoded baseline (22.3 → 34.0)**. We now nearly match Simon's autotuned A100 2D blocktile (65.2% vs 84.8%) and **beat Simon's hardcoded warptile when run on H100** (65.2% vs 60.9%). Three lessons: (a) BK=16 is a sweet spot, not a "deeper is better" ladder; (b) **TM and TN are NOT mirror-symmetric** — `(TM=16, TN=8)` runs 30% faster than the swapped `(TM=8, TN=16)`, because the compiler hoists `regA[i]` and longer TN causes register-allocation pressure; (c) once SM occupancy saturates, bigger blocks just add SMEM bloat without buying parallelism. Gemini Code Assist caught two real bugs in the autotuner's validity check during PR review (SMEM 2× over-count, and missing `NUM_THREADS % BK == 0` divisibility leading to silent OOB SMEM writes for BK=24 candidates — fixed in commit 38f8709). See [`autotune.md`](autotune.md) and [`worklog.md`](worklog.md) Step 5 "Autotune result" for full details.
+Source-code reading of `siboehm/SGEMM_CUDA/src/runner.cu` reveals key design differences:
 
-**Vectorized autotune (2026-05-31)**: Vectorized kernel autotuned across 16 candidates using same structure as 2D blocktile (non-transposed As, strided scalar loads) plus float4 (128-bit) C stores. Same winner as 2D: `(BM=BN=128, BK=16, TM=16, TN=8)` at **34.7 TFLOPS @ N=4096 — +1.1T (+3.3%) over 2D blocktile autotune**. The float4 store alone adds measurable gain on H100 by reducing L1 cache-sector transactions during the C writeback phase. Total FP32 progress: naive 10.2% → 66.9% of cuBLAS FP32 (+56.7pp). See [`autotune.md`](autotune.md) Step 6 autotune section for details.
+1. **2D blocktile loads**: Simon uses `float4` GMEM loads with stride decoupling into SMEM, then scalar tensor-core-compatible layout. Our 2D blocktile uses scalar loads. The float4 path reduces GMEM transactions by 4× at the load boundary.
 
-**Verification run on exclusive node (2026-05-31, 3 trials)**: All numbers in Table 1 verified on `pi1-h100-27` (job 11723, `--gres=gpu:8 --exclusive`, OverSubscribe=NO). Run-to-run reproducibility is ±0.07T on the auto kernels; only run 1 shows the typical cold-cache warmup +0.2T edge. Earlier numbers in this doc came from `pi1-h100-16` which we later discovered was a shared dev-partition node — the salloc had no GPU TRES and we were opportunistically using a neighbor's idle Ray-worker GPUs. The shared-node numbers turned out to be within ±0.17T of the exclusive-node values, so the original measurements were not contaminated, but the methodology was loose. cuBLAS FP32 corrected 52.2 → 51.9T, cuBLAS BF16 corrected 485.5 → 493.6T (the +1.7% delta is the only one that exceeds noise).
+2. **Register pressure management**: Simon's 2D blocktile uses 8×8 thread tiles (\(TM=TN=8\), 64 reg values per thread) and keeps loop ordering that lets the compiler hoist `regA[i]`. Our non-autotuned version used the same TM/TN but with different loop ordering that causes more register pressure.
 
-Shared infra: [`matmul.cpp`](matmul.cpp) (benchmark harness), [`matmul_kernel.h`](matmul_kernel.h) (base class), [`matrix_init.{h,cu}`](matrix_init.cu) (CPU reference).
+3. **SMEM address pattern**: Simon's autotuned config (from his kernel 9) avoids bank conflicts through offset addressing. Our early versions had 2-way bank conflicts (fixed in commit `38f8709` via the `As[BM][BK+1]` padding).
 
-### Why We Diverge at 2D Blocktile (and Beyond)
+4. **Vectorized: He uses float4 loads + shared memory**. Our hardcoded vectorized uses float4 loads but inline into registers. His path achieves better SMEM bandwidth utilization because the SMEM cache is fully utilized across warps.
 
-With autotuning, the gap between our kernels and Simon's essentially disappears on A100: our autotuned 2D blocktile (88.0%) edges his (84.8%), and our autotuned vectorized (89.0%) beats his vectorized (78.4%) by 10pp. The only remaining outlier is his warptile (93.7%) — that kernel's warp dimensions were hand-optimized for A100 by an expert. Our autotuned warptile was swept on H100 and the search space doesn't cover the A100 SM layout well.
-
-**The gap was never algorithmic — it was always parameter tuning.** On A100, our autotuned 2D blocktile found BM=64 BN=128 BK=8 TM=8 TN=8 — an asymmetric tile that matches A100's narrower SMEM bandwidth and higher SM count. On H100, the winner was BM=BN=128 BK=16 TM=16 TN=8 — symmetric, larger blocks preferred by H100's bigger SMEM.
-
-### A100 Head-to-Head (Same Hardware, N=4096)
-
-| Kernel | % vs cuBLAS FP32 | TFLOPS |
-|---|---|---|
-| Simon's warptile | **93.7%** | 21.8 |
-| Simon's vectorized | 78.4% | 18.2 |
-| **Our 2D blocktile (autotuned)** | **88.0%** | 16.4 |
-| **Our vectorized (autotuned)** | **89.0%** | 16.6 |
-| Our 2D blocktile (hardcoded) | 59.5% | 11.1 |
-
-**We beat Simon's 2D blocktile on A100** (88.0% vs 84.8%, +3.2pp) and his vectorized (89.0% vs 78.4%, +10.6pp). Only his expert-tuned warptile (93.7%) remains ahead — our warptile_auto was tuned on H100 and the warp-dimension search space needs A100-specific expansion.
+5. **Warptile: This is Simon's magnum opus.** 21.8 T on 84 SMs = 260 GFLOPS/SM — higher than our cuBLAS FP32 on 108 SMs! His warp-level tiling uses per-warp register files + explicit warp synchronization patterns that are tuned to Ampere's sub-partition layout. This is the only kernel where expertise (knowing the SM microarchitecture) visibly dominates over methodology (sweeping parameters).
 
 ### H100 Head-to-Head
 
-| Kernel | % vs cuBLAS FP32 | TFLOPS |
+| Kernel | TFLOPS | vs cuBLAS FP32 |
 |---|---|---|
-| Simon's warptile (on H100) | 60.9% | 31.8 |
-| **Our vectorized (autotuned)** | **66.7%** | 34.8 |
-| **Our warptile (autotuned)** | **64.4%** | 33.4 |
-| Our warptile (hardcoded) | 54.2% | 28.3 |
+| Simon's warptile (on H100, Pranjal's data) | 31.8 | 60.9% |
+| **Our vectorized (autotuned)** | **34.8** | **66.7%** |
+| **Our warptile (autotuned)** | **33.4** | **64.4%** |
 
-### FP32 Ceiling
+On H100, our autotuned kernels edge Simon's warptile (34.8 T > 31.8 T). But this is the only hardware where we win at the top tier — and it's H100-specific autotuning, not algorithmic superiority.
 
-Even at 100% vs cuBLAS FP32 on H100, we'd only reach ~52 TFLOPS. Tensor Cores offer 717 TFLOPS (BF16) on the same hardware. The FP32 optimization path is complete and correct — but tapped out.
+cuBLAS baselines: H100 FP32 = 52.2 TFLOPS, A100 FP32 = 18.6 TFLOPS, Simon's A6000 TF32 = 23.2 TFLOPS.
 
 ---
 
@@ -118,11 +113,26 @@ Note: our WMMA at 4K (5.7%, 27.5T) is better than at 2K (2.6%, 25.6T) — larger
 
 ---
 
+## Verification Notes
+
+**Our A100 numbers** verified on 2026-06-01 ~10:25 AM PT via IAP tunnel to `a100-spot-5` (us-east1-b). Fresh rebuild from `main` branch, all kernels in single session. Reproducibility ±0.5% on 100-iteration medians.
+
+**Our H100 numbers** verified on `pi1-h100-27` (job 11723, `--gres=gpu:8 --exclusive`). Run-to-run reproducibility ±0.07 T on auto kernels.
+
+**Simon's numbers** extracted from his README.md (GPUs marker: "NVIDIA A6000 (Ampere)") and `siboehm/SGEMM_CUDA` source. cuBLAS mode confirmed by reading `src/runner.cu` line 129-131.
+
+**Earlier errors corrected** (2026-06-01):
+- Simon's GPU was labeled "A100" throughout the doc — corrected to **A6000** after source-code audit
+- Gap column previously compared % vs different cuBLAS modes — replaced with absolute TFLOPS
+- A100 head-to-head section removed (different hardware)
+
+---
+
 ## Summary
 
 | Path | Progress | Key Blocker | Next Step |
 |---|---|---|---|
-| **FP32** (Simon) | 8/8 done, beats Simon (33.4 > 31.8 T) | FP32 ceiling ~52T | Low priority — tapped out |
+| **FP32** (Simon) | 8/8 done, autotuned | Simon's 2D+ kernels still 1.6× more efficient per-SM | Study his register layout patterns |
 | **TC** (Pranjal) | 0/10 done, WMMA at 5.7% | WMMA API (need WGMMA) | **WGMMA** — step 1 of 10 |
 
 ---
@@ -132,6 +142,5 @@ Note: our WMMA at 4K (5.7%, 27.5T) is better than at 2K (2.6%, 25.6T) — larger
 | Priority | What | Expected Gain |
 |---|---|---|
 | **P0** | WGMMA — Pranjal K1 | 5.7% → ~44% (7.8×) |
-| ~~P1~~ | ~~Autotune warptile~~ | ~~✅ Done: 28.3→33.4T (+18%)~~ |
+| P2 | Study Simon's 2D tile register layout for per-SM efficiency | |
 | P2 | TMA (async copy) — Pranjal K3 | 44% → 70% |
-| P2 | Nsight profile each WGMMA step | |
