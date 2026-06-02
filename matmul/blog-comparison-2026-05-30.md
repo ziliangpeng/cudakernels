@@ -17,25 +17,27 @@
 | Benchmark | 10 repeats, mean elapsed | 100 iterations, median |
 | N sizes | {128, 256, 512, 1K, 2K, 4K} | N=4096 |
 
-**Why the cuBLAS baseline differs**: Simon uses `CUBLAS_GEMM_DEFAULT_TENSOR_OP` which lets cuBLAS use TF32 Tensor Cores on Ampere (~23.2 T). We explicitly set `CUBLAS_PEDANTIC_MATH` to force pure FP32 (~18.6 T). This means **% vs cuBLAS cannot be compared across papers** — we must use absolute TFLOPS.
+**Why the cuBLAS baseline differs**: Simon uses `CUBLAS_GEMM_DEFAULT_TENSOR_OP` which lets cuBLAS use TF32 Tensor Cores on Ampere. We set `CUBLAS_PEDANTIC_MATH` to force pure FP32. Each % is vs its own cuBLAS.
 
 ---
 
-## Table 1: FP32 Path — Ours vs Simon (Absolute TFLOPS, N=4096)
+## Table 1: FP32 Path — Ours vs Simon (N=4096)
 
-| Step | Src | H100 (4K) | A100 (4K) | Simon (A6000, 4K) | TFLOPS Gap |
-|---|---|---|---|---|---|
-| Naive | [link](matmul_naive.cu) | 5.3 T | 2.4 T | 0.3 T | +2.1 T ✅ |
-| Coalesced | [link](matmul_coalesced.cu) | 5.7 T | 3.0 T | 2.0 T | +1.0 T ≈ |
-| SMEM tiling | [link](matmul_smem.cu) | 9.0 T | 5.3 T | 3.0 T | +2.3 T ✅ |
-| 1D blocktile | [link](matmul_1d_blocktile.cu) | 17.6 T | 10.0 T | 8.5 T | +1.5 T |
-| **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | **19.3 T** | **11.2 T** | — | — |
-| 2D blocktile | [link](matmul_2d_blocktile.cu) | 22.4 T | 11.1 T | 16.0 T | **−4.9 T** ⚠️ |
-| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | **34.0 T** | **16.4 T** | **19.7 T** | **−3.3 T** |
-| Vectorized | [link](matmul_vectorized.cu) | 32.9 T | 13.9 T | 18.2 T | **−4.3 T** ⚠️ |
-| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | **34.8 T** | **16.6 T** | — | — |
-| Warptile | [link](matmul_warptile.cu) | 28.3 T | 14.0 T | 21.8 T | **−7.8 T** ⚠️⚠️ |
-| **Warptile (autotuned)** | [link](matmul_warptile.cu) | **33.4 T** | **15.0 T** | — | — |
+| Step | Src | H100 (TFLOPS) | H100 (% vs cuBLAS FP32) | A100 (TFLOPS) | A100 (% vs cuBLAS FP32) | Simon (A6000, TFLOPS) | Simon (% vs cuBLAS TF32) | TFLOPS Gap |
+|---|---|---|---|---|---|---|---|---|
+| Naive | [link](matmul_naive.cu) | 5.3 T | 10.2% | 2.4 T | 12.8% | 0.3 T | 1.3% | +2.1 T ✅ |
+| Coalesced | [link](matmul_coalesced.cu) | 5.7 T | 10.9% | 3.0 T | 16.0% | 2.0 T | 8.5% | +1.0 T ≈ |
+| SMEM tiling | [link](matmul_smem.cu) | 9.0 T | 17.2% | 5.3 T | 28.4% | 3.0 T | 12.8% | +2.3 T ✅ |
+| 1D blocktile | [link](matmul_1d_blocktile.cu) | 17.6 T | 33.7% | 10.0 T | 53.5% | 8.5 T | 36.5% | +1.5 T |
+| **1D blocktile (autotuned)** | [link](matmul_1d_blocktile.cu) | **19.3 T** | **36.9%** | **11.2 T** | **59.9%** | — | — | — |
+| 2D blocktile | [link](matmul_2d_blocktile.cu) | 22.4 T | 42.9% | 11.1 T | 59.5% | 16.0 T | 68.7% | **−4.9 T** ⚠️ |
+| **2D blocktile (autotuned)** | [link](matmul_2d_blocktile.cu) | **34.0 T** | **65.2%** | **16.4 T** | **88.0%** | **19.7 T** | **84.8%** | **−3.3 T** |
+| Vectorized | [link](matmul_vectorized.cu) | 32.9 T | 63.0% | 13.9 T | 74.8% | 18.2 T | 78.4% | **−4.3 T** ⚠️ |
+| **Vectorized (autotuned)** | [link](matmul_vectorized.cu) | **34.8 T** | **66.7%** | **16.6 T** | **89.0%** | — | — | — |
+| Warptile | [link](matmul_warptile.cu) | 28.3 T | 54.2% | 14.0 T | 75.5% | 21.8 T | 93.7% | **−7.8 T** ⚠️⚠️ |
+| **Warptile (autotuned)** | [link](matmul_warptile.cu) | **33.4 T** | **64.4%** | **15.0 T** | **80.7%** | — | **—** | — |
+
+**Baselines**: H100 cuBLAS FP32 = 52.2 T | A100 cuBLAS FP32 = 18.6 T | Simon's A6000 cuBLAS TF32 = 23.2 T
 
 Each `link` in the Src column points to the corresponding `matmul_<step>.cu` file in this directory. Simon's autotuned results are: 2D blocktile = 19.7 T; warptile was hand-tuned (not autotuned).
 
@@ -47,7 +49,7 @@ Each `link` in the Src column points to the corresponding `matmul_<step>.cu` fil
 
 **Our autotuning helps significantly** (+48% on 2D, from 11.1→16.4 T), but doesn't close the gap. His autotuned 2D blocktile at 19.7 T is still 1.6× per-SM of ours. The gap originates in tile design (register layout, load patterns, loop ordering) rather than parameter selection alone.
 
-**cuBLAS baseline can't be used for % normalization** — he measures against TF32 (23.2 T), we against FP32 (18.6 T). His "84.8%" is a TF32-relative number; our "88.0%" is FP32-relative. They mean different things and can't be directly compared. Simon's absolute 19.7 T > our 16.4 T, regardless of percentages.
+**cuBLAS baseline can't be used for cross-paper normalization**: his % is TF32-relative (23.2 T), ours is FP32-relative (18.6 T). TFLOPS is the common unit — by that measure, Simon's absolute 19.7 T > our 16.4 T at 2D autotuned.
 
 ### Why Simon's Kernels Are More Efficient Per-SM
 
