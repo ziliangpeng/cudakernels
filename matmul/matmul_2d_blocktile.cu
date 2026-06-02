@@ -23,8 +23,8 @@ template<int BM, int BN, int BK, int TM, int TN>
 __global__ void matmul2DBlocktileKernelT(const float * __restrict__ A,
                                           const float * __restrict__ B,
                                           float *C, int N) {
-    __shared__ float As[BM][BK];
-    __shared__ float Bs[BK][BN];
+    __shared__ float As[BM * BK];
+    __shared__ float Bs[BK * BN];
 
     const int threadCol = threadIdx.x % (BN / TN);
     const int threadRow = threadIdx.x / (BN / TN);
@@ -56,9 +56,9 @@ __global__ void matmul2DBlocktileKernelT(const float * __restrict__ A,
         for (int loadOffset = 0; loadOffset < BM; loadOffset += strideA) {
             int row = innerRowA + loadOffset;
             if (blockRow * BM + row < N && tileIdx + innerColA < N) {
-                As[row][innerColA] = A[row * N + innerColA];
+                As[row * BK + innerColA] = A[row * N + innerColA];
             } else {
-                As[row][innerColA] = 0.0f;
+                As[row * BK + innerColA] = 0.0f;
             }
         }
 
@@ -67,9 +67,9 @@ __global__ void matmul2DBlocktileKernelT(const float * __restrict__ A,
         for (int loadOffset = 0; loadOffset < BK; loadOffset += strideB) {
             int row = innerRowB + loadOffset;
             if (tileIdx + row < N && blockCol * BN + innerColB < N) {
-                Bs[row][innerColB] = B[row * N + innerColB];
+                Bs[row * BN + innerColB] = B[row * N + innerColB];
             } else {
-                Bs[row][innerColB] = 0.0f;
+                Bs[row * BN + innerColB] = 0.0f;
             }
         }
 
@@ -83,11 +83,11 @@ __global__ void matmul2DBlocktileKernelT(const float * __restrict__ A,
         for (int dotIdx = 0; dotIdx < BK; dotIdx++) {
             #pragma unroll
             for (int i = 0; i < TM; i++) {
-                regA[i] = As[threadRow * TM + i][dotIdx];
+                regA[i] = As[(threadRow * TM + i) * BK + dotIdx];
             }
             #pragma unroll
             for (int j = 0; j < TN; j++) {
-                regB[j] = Bs[dotIdx][threadCol * TN + j];
+                regB[j] = Bs[dotIdx * BN + threadCol * TN + j];
             }
             #pragma unroll
             for (int i = 0; i < TM; i++) {
