@@ -36,7 +36,7 @@ __global__ void matmul2DBlocktileKernelT(const float * __restrict__ A,
     B += blockCol * BN;
     C += blockRow * BM * N + blockCol * BN;
 
-    float threadResults[TM][TN] = {{0.0f}};
+    float threadResults[TM * TN] = {0.0f};
     float regA[TM];
     float regB[TN];
 
@@ -93,7 +93,7 @@ __global__ void matmul2DBlocktileKernelT(const float * __restrict__ A,
             for (int i = 0; i < TM; i++) {
                 #pragma unroll
                 for (int j = 0; j < TN; j++) {
-                    threadResults[i][j] += regA[i] * regB[j];
+                    threadResults[i * TN + j] += regA[i] * regB[j];
                 }
             }
         }
@@ -109,7 +109,7 @@ __global__ void matmul2DBlocktileKernelT(const float * __restrict__ A,
             int globalRow = blockRow * BM + threadRow * TM + i;
             int globalCol = blockCol * BN + threadCol * TN + j;
             if (globalRow < N && globalCol < N) {
-                C[(threadRow * TM + i) * N + threadCol * TN + j] = threadResults[i][j];
+                C[(threadRow * TM + i) * N + threadCol * TN + j] = threadResults[i * TN + j];
             }
         }
     }
